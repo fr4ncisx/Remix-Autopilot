@@ -1,6 +1,6 @@
 # Remix Autopilot
 
-![Rust latest](https://img.shields.io/badge/Rust-latest-orange?style=flat-square&logo=rust) ![Ratatui TUI](https://img.shields.io/badge/TUI-Ratatui-5c7cfa?style=flat-square) ![Provider aware AI](https://img.shields.io/badge/LLM-provider--aware-22c55e?style=flat-square) ![Git automation](https://img.shields.io/badge/Git-automation-f97316?style=flat-square&logo=git) ![Tests cargo](https://img.shields.io/badge/tests-cargo-16a34a?style=flat-square)
+![Actual Version](https://img.shields.io/badge/version-0.1.0--beta-F54927?style=flat-square) ![Rust latest](https://img.shields.io/badge/Rust-latest-orange?style=flat-square&logo=rust) ![Ratatui TUI](https://img.shields.io/badge/TUI-Ratatui-5c7cfa?style=flat-square) ![Provider aware AI](https://img.shields.io/badge/LLM-provider--aware-22c55e?style=flat-square) ![Git automation](https://img.shields.io/badge/Git-automation-CC5666?style=flat-square&logo=git) ![Tests cargo](https://img.shields.io/badge/tests-cargo-16a34a?style=flat-square)
 
 Remix Autopilot is a Rust TUI for developers who want reviewable Git
 automation with a configurable AI provider. You launch it inside a working
