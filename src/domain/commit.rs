@@ -83,6 +83,13 @@ pub struct PullRequestDraft {
     pub body: String,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PrInfo {
+    pub number: i64,
+    pub title: String,
+    pub url: String,
+}
+
 impl PullRequestDraft {
     pub fn from_llm_response(response: &str) -> Result<Self> {
         let json = extract_json(response).ok_or_else(|| {
@@ -431,27 +438,30 @@ pub fn commit_plan_prompt(language: &str, context: &DiffContext) -> String {
 pub fn pr_prompt(
     language: &str,
     context: &DiffContext,
+    commits_text: &str,
     base: &str,
     head: &str,
     template: Option<&str>,
 ) -> String {
     let template_instruction = match template {
         Some(tpl) => format!(
-            "You MUST format the PR description using the following Pull Request template. Do not delete the markdown headers or structure of the template, just fill in the appropriate information based on the diff:\n\nTEMPLATE:\n{}\n\n",
+            "You MUST format the PR description using the following Pull Request template. Do not delete the markdown headers or structure of the template, just fill in the appropriate information based on the diff:\n\nTEMPLATE:\n{}\n\nAt the end of the PR body, add the watermark: 'Powered by Autopilot CLI'.\n\n",
             tpl
         ),
-        None => "Create a highly professional GitHub pull request description with production-ready standards (open-source style). The PR body must include the following sections: '### Description', '### Key Changes', '### How to Test', and '### Checklist'.\n\n".to_string()
+        None => "Create a highly professional GitHub pull request description with production-ready standards (open-source style). The PR body must include the following sections: '### Description', '### Key Changes', '### How to Test', and '### Checklist' (markdown checklist). At the end of the PR body, add the watermark: 'Powered by Autopilot CLI'.\n\n".to_string()
     };
 
     format!(
         "Create a GitHub pull request draft in {} for head branch `{}` into base `{}`. Return only JSON with string fields `title` and `body`.\n\n\
          {}\
          Do not use emojis anywhere in generated text.\n\n\
+         COMMITS:\n{}\n\n\
          STATUS:\n{}\n\nSTAT:\n{}\n\nDIFF:\n{}{}{}",
         language,
         head,
         base,
         template_instruction,
+        commits_text,
         context.status,
         context.stat,
         context.diff,
@@ -636,6 +646,17 @@ fn is_valid_commit_type(value: &str) -> bool {
             | "ci"
             | "perf"
             | "revert"
+    )
+}
+
+#[allow(dead_code)]
+pub fn resolve_conflict_prompt(language: &str, file: &str, conflict: &str) -> String {
+    format!(
+        "You are an expert developer helping to resolve git merge conflicts in {}. \n\
+         File: `{}`\n\n\
+         Conflicts:\n{}\n\n\
+         Provide the resolved content for this file. Return ONLY the content of the resolved file. Do not include markdown code fences, prose, or explanation.",
+        language, file, conflict
     )
 }
 
