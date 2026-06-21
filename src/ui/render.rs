@@ -71,6 +71,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &TuiApp) {
     }
 }
 
+
 fn render_history(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     let colors = palette(app.core.config.theme);
     let available_width = area.width as usize;
@@ -121,44 +122,39 @@ fn render_history(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
                 let text_style = Style::default().fg(text_color).bg(bg_color);
 
                 all_lines.push(Line::styled(
-                    format!("  ┌{}┐", "─".repeat(box_width.saturating_sub(2))),
+                    format!("  ┌{}┐", "─".repeat(box_width.saturating_sub(4))),
                     box_style,
                 ));
 
                 for line in display_message_lines(entry) {
                     if line.trim().is_empty() {
-                        all_lines.push(Line::styled(
-                            format!("  │ {} │", "─".repeat(content_width)),
-                            box_style,
-                        ));
+                        let padded = " ".repeat(content_width);
+                        all_lines.push(Line::from(vec![
+                            Span::styled("  │ ", box_style),
+                            Span::styled(padded, text_style),
+                            Span::styled(" │", box_style),
+                        ]));
                     } else {
-                        let chars = line.chars().collect::<Vec<_>>();
-                        if chars.is_empty() {
-                            let padded = " ".repeat(content_width);
-                            all_lines.push(Line::from(vec![
-                                Span::styled("  │ ", box_style),
-                                Span::styled(padded, text_style),
-                                Span::styled(" │", box_style),
-                            ]));
+                        let tokens = if matches!(entry.role, ChatRole::Assistant) {
+                            tokenize_diff_line(&line, &colors, text_style)
                         } else {
-                            let mut start = 0;
-                            while start < chars.len() {
-                                let end = (start + content_width).min(chars.len());
-                                let chunk: String = chars[start..end].iter().collect();
-                                let padded = format!("{:<width$}", chunk, width = content_width);
-                                all_lines.push(Line::from(vec![
-                                    Span::styled("  │ ", box_style),
-                                    Span::styled(padded, text_style),
-                                    Span::styled(" │", box_style),
-                                ]));
-                                start = end;
+                            vec![(line.clone(), text_style)]
+                        };
+
+                        let wrapped_lines = wrap_spans(tokens, content_width);
+                        for wrapped_line_spans in wrapped_lines {
+                            let mut line_spans = vec![Span::styled("  │ ", box_style)];
+                            for s in wrapped_line_spans {
+                                line_spans.push(Span::styled(s.content.into_owned(), s.style.bg(bg_color)));
                             }
+                            line_spans.push(Span::styled(" │", box_style));
+                            all_lines.push(Line::from(line_spans));
                         }
                     }
                 }
 
                 all_lines.push(Line::styled(
-                    format!("  └{}┘", "─".repeat(box_width.saturating_sub(2))),
+                    format!("  └{}┘", "─".repeat(box_width.saturating_sub(4))),
                     box_style,
                 ));
             }
@@ -271,6 +267,8 @@ fn clean_markdown_line(raw: &str) -> String {
         line = format!("{}{}", " ".repeat(leading_spaces), rest);
     } else if let Some(rest) = trimmed_start.strip_prefix('>') {
         line = format!("{}{}", " ".repeat(leading_spaces), rest.trim_start());
+    } else if (trimmed_start.starts_with("+ ") || trimmed_start.starts_with("- ")) && leading_spaces > 0 {
+        // Do not convert structured +/- detail lines with indentation (like status details)
     } else if let Some(rest) = trimmed_start
         .strip_prefix("- ")
         .or_else(|| trimmed_start.strip_prefix("* "))
@@ -282,6 +280,236 @@ fn clean_markdown_line(raw: &str) -> String {
     line.replace("**", "")
         .replace("__", "")
         .replace(['`', '*'], "")
+}
+
+
+fn tokenize_semantic_description(description: &str, _colors: &Palette, text_style: Style) -> Vec<(String, Style)> {
+    vec![(description.to_string(), text_style)]
+}
+
+fn tokenize_file_stats(text: &str, colors: &Palette, text_style: Style) -> Vec<(String, Style)> {
+    let mut tokens = Vec::new();
+    let mut last_idx = 0;
+    
+    while let Some(start_offset) = text[last_idx..].find("(+") {
+        let start_idx = last_idx + start_offset;
+        if let Some(end_offset) = text[start_idx..].find(')') {
+            let end_idx = start_idx + end_offset;
+            let inner = &text[start_idx + 1..end_idx];
+            
+            if let Some(minus_offset) = inner.find('-') {
+                let minus_idx = start_idx + 1 + minus_offset;
+                let plus_part = &text[start_idx + 1..minus_idx];
+                let minus_part = &text[minus_idx..end_idx];
+                
+                let plus_num_trimmed = plus_part.trim_end_matches(|c: char| c == ',' || c.is_whitespace());
+                
+                if plus_num_trimmed.starts_with('+') && minus_part.starts_with('-') {
+                    let prefix = &text[last_idx..start_idx];
+                    if !prefix.is_empty() {
+                        tokens.push((prefix.to_string(), text_style));
+                    }
+                    
+                    tokens.push(("(".to_string(), text_style));
+                    tokens.push((plus_num_trimmed.to_string(), Style::default().fg(colors.success)));
+                    
+                    let separator = &plus_part[plus_num_trimmed.len()..];
+                    if !separator.is_empty() {
+                        tokens.push((separator.to_string(), text_style));
+                    }
+                    
+                    tokens.push((minus_part.to_string(), Style::default().fg(colors.warning)));
+                    tokens.push((")".to_string(), text_style));
+                    
+                    last_idx = end_idx + 1;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    
+    if last_idx < text.len() {
+        tokens.push((text[last_idx..].to_string(), text_style));
+    }
+    
+    tokens
+}
+
+fn tokenize_description_part(text: &str, colors: &Palette, text_style: Style) -> Vec<(String, Style)> {
+    if let Some(pos) = text.find(" - ") {
+        let lhs = &text[..pos + 3];
+        let rhs = &text[pos + 3..];
+        
+        let mut tokens = tokenize_file_stats(lhs, colors, text_style);
+        tokens.extend(tokenize_semantic_description(rhs, colors, text_style));
+        tokens
+    } else {
+        tokenize_file_stats(text, colors, text_style)
+    }
+}
+
+fn tokenize_diff_line(line: &str, colors: &Palette, text_style: Style) -> Vec<(String, Style)> {
+    let trimmed = line.trim_start();
+
+    if trimmed.starts_with("+++") || trimmed.starts_with("---") {
+        return vec![(line.to_string(), Style::default().fg(colors.muted))];
+    }
+
+    if trimmed.starts_with("- ") {
+        let rest = &trimmed[2..];
+        let rest_lower = rest.to_lowercase();
+        if rest_lower.starts_with("agregado") || rest_lower.starts_with("added") || rest_lower.starts_with("copiado") || rest_lower.starts_with("copied") {
+            return vec![(line.to_string(), Style::default().fg(colors.success))];
+        }
+        if rest_lower.starts_with("eliminado") || rest_lower.starts_with("deleted") || rest_lower.starts_with("conflict") || rest_lower.starts_with("conflicto") {
+            return vec![(line.to_string(), Style::default().fg(colors.warning))];
+        }
+        if rest_lower.starts_with("modificado") || rest_lower.starts_with("modified") ||
+           rest_lower.starts_with("renombrado") || rest_lower.starts_with("renamed") ||
+           rest_lower.starts_with("ignorado") || rest_lower.starts_with("ignored") ||
+           rest_lower.starts_with("sin tracking") || rest_lower.starts_with("untracked") ||
+           rest_lower.starts_with("cambiado") || rest_lower.starts_with("changed") {
+            return vec![(line.to_string(), text_style)];
+        }
+    }
+
+    if trimmed.starts_with('+') {
+        return vec![(line.to_string(), Style::default().fg(colors.success))];
+    }
+    if trimmed.starts_with('-') {
+        return vec![(line.to_string(), Style::default().fg(colors.warning))];
+    }
+    if trimmed.starts_with("@@") && trimmed.ends_with("@@") {
+        return vec![(line.to_string(), Style::default().fg(colors.info))];
+    }
+
+    let mut tokens = Vec::new();
+    let mut current_byte = 0;
+    let bytes_len = line.len();
+
+    while current_byte < bytes_len {
+        let rest = &line[current_byte..];
+        if let Some(first_rel) = rest.find("@@") {
+            let first = current_byte + first_rel;
+            if let Some(second_rel) = rest[first_rel + 2..].find("@@") {
+                let second = first + 2 + second_rel;
+
+                if first > current_byte {
+                    let before_text = &line[current_byte..first];
+                    if !trimmed.starts_with('•') {
+                        tokens.extend(tokenize_semantic_description(before_text, colors, text_style));
+                    } else {
+                        tokens.extend(tokenize_description_part(before_text, colors, text_style));
+                    }
+                }
+
+                let hunk_text = &line[first..second + 2];
+                tokens.push((hunk_text.to_string(), Style::default().fg(colors.info)));
+
+                current_byte = second + 2;
+                continue;
+            }
+        }
+
+        let remaining_text = &line[current_byte..];
+        if !trimmed.starts_with('•') {
+            tokens.extend(tokenize_semantic_description(remaining_text, colors, text_style));
+        } else {
+            tokens.extend(tokenize_description_part(remaining_text, colors, text_style));
+        }
+        break;
+    }
+
+    tokens
+}
+
+fn wrap_spans(spans: Vec<(String, Style)>, content_width: usize) -> Vec<Vec<Span<'static>>> {
+    let mut tokens = Vec::new();
+    for (text, style) in spans {
+        let mut current = String::new();
+        let mut current_is_ws = None;
+        for ch in text.chars() {
+            let is_ws = ch.is_whitespace();
+            if let Some(prev_is_ws) = current_is_ws {
+                if prev_is_ws != is_ws {
+                    tokens.push((current, style, prev_is_ws));
+                    current = String::new();
+                }
+            }
+            current_is_ws = Some(is_ws);
+            current.push(ch);
+        }
+        if !current.is_empty() {
+            tokens.push((current, style, current_is_ws.unwrap_or(false)));
+        }
+    }
+
+    let mut lines = Vec::new();
+    let mut current_line = Vec::new();
+    let mut current_len = 0;
+
+    let push_and_pad = |lines: &mut Vec<Vec<Span<'static>>>, mut line: Vec<Span<'static>>, len: usize| {
+        let padding = content_width.saturating_sub(len);
+        if padding > 0 {
+            line.push(Span::styled(" ".repeat(padding), Style::default()));
+        }
+        lines.push(line);
+    };
+
+    for (text, style, is_ws) in tokens {
+        let chars: Vec<char> = text.chars().collect();
+        let token_len = chars.len();
+
+        if current_len + token_len <= content_width {
+            current_line.push(Span::styled(text, style));
+            current_len += token_len;
+        } else {
+            if is_ws {
+                let line_to_push = std::mem::take(&mut current_line);
+                let len_to_push = current_len;
+                current_len = 0;
+                push_and_pad(&mut lines, line_to_push, len_to_push);
+            } else {
+                if token_len > content_width {
+                    let mut start = 0;
+                    while start < chars.len() {
+                        let remaining = content_width.saturating_sub(current_len);
+                        if remaining == 0 {
+                            let line_to_push = std::mem::take(&mut current_line);
+                            let len_to_push = current_len;
+                            current_len = 0;
+                            push_and_pad(&mut lines, line_to_push, len_to_push);
+                            continue;
+                        }
+                        let take = (chars.len() - start).min(remaining);
+                        let chunk: String = chars[start..start + take].iter().collect();
+                        current_line.push(Span::styled(chunk, style));
+                        current_len += take;
+                        start += take;
+                        if current_len == content_width {
+                            let line_to_push = std::mem::take(&mut current_line);
+                            let len_to_push = current_len;
+                            current_len = 0;
+                            push_and_pad(&mut lines, line_to_push, len_to_push);
+                        }
+                    }
+                } else {
+                    let line_to_push = std::mem::take(&mut current_line);
+                    let len_to_push = current_len;
+                    push_and_pad(&mut lines, line_to_push, len_to_push);
+                    current_line = vec![Span::styled(text, style)];
+                    current_len = token_len;
+                }
+            }
+        }
+    }
+
+    if !current_line.is_empty() || lines.is_empty() {
+        push_and_pad(&mut lines, current_line, current_len);
+    }
+
+    lines
 }
 
 fn replace_markdown_links(line: &str) -> String {
@@ -422,8 +650,8 @@ fn render_input(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
         }
     } else if app.input.is_empty() {
         let placeholder = match lang.trim() {
-            "spanish" | "español" | "espanol" => "Pregunta lo que sea o usa / para comandos",
-            _ => "Ask anything or use / for commands",
+            "spanish" | "español" | "espanol" => "Escribe / para usar los comandos del sistema",
+            _ => "Type / to use system commands",
         };
         line_spans.push(Span::styled(placeholder, Style::default().fg(colors.muted)));
     } else {
@@ -1664,7 +1892,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
             if !branches.remote.is_empty() {
                 rows.push(ListItem::new(Line::from(vec![Span::styled(
                     origin_header,
-                    Style::default().fg(colors.warning).bold(),
+                    Style::default().fg(colors.accent).bold(),
                 )])));
                 for branch in &branches.remote {
                     if item_index == *selected {
@@ -1683,7 +1911,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
             if !branches.local.is_empty() {
                 rows.push(ListItem::new(Line::from(vec![Span::styled(
                     local_header,
-                    Style::default().fg(colors.warning).bold(),
+                    Style::default().fg(colors.accent).bold(),
                 )])));
                 for branch in &branches.local {
                     if item_index == *selected {
@@ -1711,6 +1939,127 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
                     colors,
                 )),
                 area,
+                &mut state,
+            );
+        }
+        Modal::BranchDiff { branches, selected } => {
+            let current_branch = app.core.status().branch.clone();
+
+            let title = match lang.trim() {
+                "spanish" | "español" | "espanol" => "Comparar con rama",
+                _ => "Compare with branch",
+            };
+
+            let outer_block = modal_block(title, colors);
+            frame.render_widget(outer_block.clone(), area);
+            let inner_area = outer_block.inner(area);
+
+            // Split the inner area:
+            // 1. Top Panel (height 4): Current branch + instructions
+            // 2. Separator line (height 1)
+            // 3. Branches List (remaining height)
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(4),
+                    Constraint::Length(1),
+                    Constraint::Min(3),
+                ])
+                .split(inner_area);
+
+            // 1. Top Panel Content
+            let top_text = match lang.trim() {
+                "spanish" | "español" | "espanol" => vec![
+                    Line::from(vec![
+                        Span::raw("Rama actual: "),
+                        Span::styled(format!(" {} ", current_branch), Style::default().fg(colors.success).bg(colors.status_bg).bold()),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled("Selecciona la rama con la que deseas comparar:", Style::default().fg(colors.text).bold())),
+                    Line::from(Span::styled("Esto comparará tu estado actual contra la rama seleccionada con IA.", Style::default().fg(colors.muted))),
+                ],
+                _ => vec![
+                    Line::from(vec![
+                        Span::raw("Current branch: "),
+                        Span::styled(format!(" {} ", current_branch), Style::default().fg(colors.success).bg(colors.status_bg).bold()),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled("Select the branch to compare against:", Style::default().fg(colors.text).bold())),
+                    Line::from(Span::styled("This will compare your current state with the selected branch using AI.", Style::default().fg(colors.muted))),
+                ],
+            };
+            frame.render_widget(Paragraph::new(top_text), chunks[0]);
+
+            // 2. Separator Line
+            let sep_line = Paragraph::new(Span::styled(
+                "─".repeat(inner_area.width as usize),
+                Style::default().fg(colors.border),
+            ));
+            frame.render_widget(sep_line, chunks[1]);
+
+            // 3. Branches List Panel
+            let origin_header = "origin";
+            let local_header = match lang.trim() {
+                "spanish" | "español" | "espanol" => "local",
+                _ => "local",
+            };
+            let current_suffix = match lang.trim() {
+                "spanish" | "español" | "espanol" => " actual",
+                _ => " current",
+            };
+
+            let mut rows = Vec::new();
+            let mut selected_row = None;
+            let mut item_index = 0usize;
+
+            if !branches.remote.is_empty() {
+                rows.push(ListItem::new(Line::from(vec![Span::styled(
+                    origin_header,
+                    Style::default().fg(colors.accent).bold(),
+                )])));
+                for branch in &branches.remote {
+                    if item_index == *selected {
+                        selected_row = Some(rows.len());
+                    }
+                    rows.push(branch_switch_item(
+                        branch,
+                        item_index == *selected,
+                        current_suffix,
+                        colors,
+                    ));
+                    item_index += 1;
+                }
+            }
+
+            if !branches.local.is_empty() {
+                rows.push(ListItem::new(Line::from(vec![Span::styled(
+                    local_header,
+                    Style::default().fg(colors.accent).bold(),
+                )])));
+                for branch in &branches.local {
+                    if item_index == *selected {
+                        selected_row = Some(rows.len());
+                    }
+                    rows.push(branch_switch_item(
+                        branch,
+                        item_index == *selected,
+                        current_suffix,
+                        colors,
+                    ));
+                    item_index += 1;
+                }
+            }
+
+            let hint = match lang.trim() {
+                "spanish" | "español" | "espanol" => "selecc  Esc cerrar",
+                _ => "select  Esc close",
+            };
+            let mut state = ListState::default();
+            state.select(selected_row);
+            
+            frame.render_stateful_widget(
+                List::new(rows).block(Block::default().title(format!(" ↑↓ Enter {}", hint)).title_alignment(ratatui::layout::Alignment::Right).title_style(Style::default().fg(colors.muted))),
+                chunks[2],
                 &mut state,
             );
         }
@@ -2115,12 +2464,41 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
                     .style(Style::default().bg(colors.modal_bg)),
                 area,
             );
+            let commit_text_lines = text.lines().count();
+            let commit_visible = inner_commit[0].height as usize;
+            let commit_max_scroll = commit_text_lines.saturating_sub(commit_visible);
+            let commit_effective_scroll = (*scroll).min(commit_max_scroll);
             frame.render_widget(
                 Paragraph::new(text)
-                    .scroll((*scroll as u16, 0))
+                    .scroll((commit_effective_scroll as u16, 0))
                     .wrap(Wrap { trim: true }),
                 inner_commit[0],
             );
+            if commit_max_scroll > 0 {
+                let indicator = if commit_effective_scroll >= commit_max_scroll {
+                    "\u{25b2} PgUp".to_string()
+                } else {
+                    format!(
+                        "\u{25bc} PgDn  {}/{}",
+                        commit_effective_scroll + 1,
+                        commit_max_scroll + 1
+                    )
+                };
+                let indicator_area = Rect {
+                    x: inner_commit[0].x,
+                    y: inner_commit[0].y + inner_commit[0].height.saturating_sub(1),
+                    width: inner_commit[0].width,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        indicator,
+                        Style::default().fg(colors.muted),
+                    ))
+                    .alignment(Alignment::Right),
+                    indicator_area,
+                );
+            }
             frame.render_widget(
                 plain_action_list(&actions, *selected, colors),
                 inner_commit[1],
@@ -2134,9 +2512,9 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
         } => {
             let is_spanish = matches!(lang.trim(), "spanish" | "español" | "espanol");
             let pr_title = if is_spanish {
-                "Revisar Pull Request \u{2502} \u{2191}\u{2195} Enter  PgUp/PgDn scroll  Esc atr\u{00e1}s"
+                "Revisar Pull Request"
             } else {
-                "Review Pull Request \u{2502} \u{2191}\u{2195} Enter  PgUp/PgDn scroll  Esc back"
+                "Review Pull Request"
             };
             let actions = if is_spanish {
                 vec![
@@ -2221,13 +2599,43 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
                 )),
                 layout[1],
             );
+            let text_line_count = text.lines().count();
+            let visible_text_height = layout[2].height as usize;
+            let max_pr_scroll = text_line_count.saturating_sub(visible_text_height);
+            let effective_scroll = (*scroll).min(max_pr_scroll);
             frame.render_widget(
                 Paragraph::new(text)
-                    .scroll((*scroll as u16, 0))
+                    .scroll((effective_scroll as u16, 0))
                     .wrap(Wrap { trim: true })
                     .style(Style::default().fg(colors.text)),
                 layout[2],
             );
+            // Scroll position indicator between text and actions
+            if max_pr_scroll > 0 {
+                let indicator = if effective_scroll >= max_pr_scroll {
+                    "\u{25b2} PgUp".to_string()
+                } else {
+                    format!(
+                        "\u{25bc} PgDn  {}/{}",
+                        effective_scroll + 1,
+                        max_pr_scroll + 1
+                    )
+                };
+                let indicator_area = Rect {
+                    x: layout[2].x,
+                    y: layout[2].y + layout[2].height.saturating_sub(1),
+                    width: layout[2].width,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        indicator,
+                        Style::default().fg(colors.muted),
+                    ))
+                    .alignment(Alignment::Right),
+                    indicator_area,
+                );
+            }
             frame.render_widget(
                 onboarding_action_list(&actions, *selected, colors),
                 layout[3],
