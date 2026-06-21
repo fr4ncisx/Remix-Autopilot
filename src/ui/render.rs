@@ -86,7 +86,10 @@ fn render_history(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     for entry in &app.history {
         let (role_label, pcolor) = match entry.role {
             ChatRole::User => ("> You", colors.user),
-            ChatRole::Assistant => ("Autopilot", colors.assistant),
+            ChatRole::Assistant => match app.execution_mode {
+                crate::ui::state::ExecutionMode::Scout => ("Scout", colors.assistant),
+                crate::ui::state::ExecutionMode::Autopilot => ("Autopilot", colors.assistant),
+            },
             ChatRole::System => ("System", colors.system),
             ChatRole::Error => ("Error", colors.warning),
         };
@@ -278,8 +281,7 @@ fn clean_markdown_line(raw: &str) -> String {
     line = replace_markdown_links(&line);
     line.replace("**", "")
         .replace("__", "")
-        .replace('`', "")
-        .replace('*', "")
+        .replace(['`', '*'], "")
 }
 
 fn replace_markdown_links(line: &str) -> String {
@@ -492,7 +494,8 @@ fn responsive_status_lines(
         "spanish" | "español" | "espanol" => "Contexto",
         _ => "Context",
     };
-    let context_item = if let Some(usage) = app.last_context_usage {
+    let show_context_usage = app.core.config.provider == crate::domain::LlmProviderKind::Ollama;
+    let context_item = if show_context_usage && let Some(usage) = app.last_context_usage {
         let percent = usage.percent().unwrap_or(0);
         let context_color = if percent >= 85 {
             colors.warning
@@ -536,7 +539,8 @@ fn responsive_status_lines(
         compact,
     ));
     items.extend(degraded_capability_items(app, lang_str, colors));
-    if let Some(usage) = app.last_context_usage
+    if show_context_usage
+        && let Some(usage) = app.last_context_usage
         && usage.truncated
     {
         let truncated = match lang_str {
@@ -798,10 +802,8 @@ fn provider_status_span(app: &TuiApp, colors: Palette, compact: bool) -> Span<'s
             };
             let label = if compact {
                 "Ollama".to_string()
-            } else if is_spanish {
-                format!("Proveedor Ollama{}", vram_info)
             } else {
-                format!("Ollama Provider{}", vram_info)
+                format!("Ollama{}", vram_info)
             };
             Span::styled(
                 format!(" {} ", label),
@@ -1033,7 +1035,10 @@ fn degraded_capability_items(
                 .add_modifier(Modifier::BOLD),
         )),
         DependencyState::NotConfigured => items.push(capability_chip(
-            " github auth ",
+            match lang {
+                "spanish" | "español" | "espanol" => " PR requiere login ",
+                _ => " PR auth needed ",
+            },
             Style::default()
                 .fg(Color::Rgb(15, 23, 42))
                 .bg(Color::Rgb(250, 204, 21))
@@ -1474,10 +1479,26 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
             title,
             message,
             selected,
-            ..
+            kind,
         } => {
-            let options = match lang.trim() {
-                "spanish" | "español" | "espanol" => ["Sí", "No"],
+            let border_color = if matches!(kind, crate::ui::state::ConfirmKind::ResetConfiguration)
+            {
+                colors.system
+            } else {
+                colors.border
+            };
+            let outer = modal_block_with_border(title, colors, border_color);
+            frame.render_widget(outer.clone(), area);
+            let inner_area = outer.inner(area);
+            let options = match (lang.trim(), kind) {
+                (
+                    "spanish" | "español" | "espanol",
+                    crate::ui::state::ConfirmKind::ResetConfiguration,
+                ) => ["Resetear configuración", "Cancelar"],
+                (_, crate::ui::state::ConfirmKind::ResetConfiguration) => {
+                    ["Reset settings", "Cancel"]
+                }
+                ("spanish" | "español" | "espanol", _) => ["Sí", "No"],
                 _ => ["Yes", "No"],
             };
             let rows: Vec<ListItem> = options
@@ -1503,15 +1524,29 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
             let inner = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length((msg_lines + 2).min(area.height.saturating_sub(4))),
+                    Constraint::Length((msg_lines + 4).min(inner_area.height.saturating_sub(4))),
                     Constraint::Length(rows.len() as u16 + 2),
                 ])
-                .split(area);
+                .split(inner_area);
 
+            let question_label = match lang.trim() {
+                "spanish" | "español" | "espanol" => "Pregunta",
+                _ => "Question",
+            };
             frame.render_widget(
-                Paragraph::new(message.as_str())
-                    .wrap(Wrap { trim: true })
-                    .style(Style::default().bg(colors.modal_bg)),
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        question_label,
+                        Style::default().fg(colors.accent).bold(),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        message.clone(),
+                        Style::default().fg(colors.text).bold(),
+                    )),
+                ])
+                .wrap(Wrap { trim: true })
+                .style(Style::default().bg(colors.modal_bg)),
                 inner[0],
             );
             let hint = match lang.trim() {
@@ -1519,10 +1554,12 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
                 _ => "select  Esc cancel",
             };
             frame.render_widget(
-                List::new(rows).block(modal_block(
-                    &format!("{} \u{2502} \u{2191}\u{2195} Enter {}", title, hint),
-                    colors,
-                )),
+                List::new(rows)
+                    .style(Style::default().bg(colors.modal_bg))
+                    .block(modal_block(
+                        &format!("\u{2191}\u{2195} Enter {}", hint),
+                        colors,
+                    )),
                 inner[1],
             );
         }
@@ -1598,6 +1635,134 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
                 &mut state,
             );
         }
+        Modal::ProtectedBranchCommit {
+            branch,
+            branches,
+            selected,
+            new_branch,
+            editing_new_branch,
+        } => {
+            let is_spanish = matches!(lang.trim(), "spanish" | "español" | "espanol");
+            let title = if is_spanish {
+                "Rama protegida"
+            } else {
+                "Protected branch"
+            };
+            let warning_bg = Color::Rgb(254, 226, 226);
+            let warning_fg = Color::Rgb(127, 29, 29);
+            let warning_border = Color::Rgb(248, 113, 113);
+            let available = branches.total_count();
+            let actions = [
+                if is_spanish {
+                    format!("Cambiar de rama ({available} disponibles)")
+                } else {
+                    format!("Switch branch ({available} available)")
+                },
+                if is_spanish {
+                    "Crear rama nueva".to_string()
+                } else {
+                    "Create new branch".to_string()
+                },
+                if is_spanish {
+                    "Continuar en esta rama".to_string()
+                } else {
+                    "Continue on this branch".to_string()
+                },
+            ];
+            let branch_value = if new_branch.is_empty() {
+                if is_spanish {
+                    "feature/nueva-rama"
+                } else {
+                    "feature/new-branch"
+                }
+            } else {
+                new_branch.as_str()
+            };
+            let branch_style = if *editing_new_branch {
+                Style::default()
+                    .fg(warning_fg)
+                    .bg(Color::Rgb(255, 245, 245))
+                    .bold()
+            } else {
+                Style::default().fg(warning_fg).bg(warning_bg)
+            };
+            let rows = actions
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    let is_selected = index == *selected;
+                    let marker = if is_selected { ">" } else { " " };
+                    let style = if is_selected {
+                        Style::default().fg(warning_fg).bg(warning_bg).bold()
+                    } else {
+                        Style::default().fg(warning_fg).bg(warning_bg)
+                    };
+                    if index == 1 {
+                        ListItem::new(Line::from(vec![
+                            Span::styled(marker, style),
+                            Span::raw(" "),
+                            Span::styled(action.clone(), style),
+                            Span::raw("  "),
+                            Span::styled(branch_value.to_string(), branch_style),
+                        ]))
+                    } else {
+                        ListItem::new(Line::from(vec![
+                            Span::styled(marker, style),
+                            Span::raw(" "),
+                            Span::styled(action.clone(), style),
+                        ]))
+                    }
+                })
+                .collect::<Vec<_>>();
+            let message = if is_spanish {
+                format!(
+                    "Estás en `{branch}`. Para evitar commits directos en main/master, cambia o crea una rama y el plan de commits se ejecuta automáticamente."
+                )
+            } else {
+                format!(
+                    "You are on `{branch}`. To avoid direct commits on main/master, switch or create a branch and the commit plan will start automatically."
+                )
+            };
+            let esc_hint = if *editing_new_branch {
+                if is_spanish { "Esc volver" } else { "Esc back" }
+            } else if is_spanish {
+                "Esc cancelar"
+            } else {
+                "Esc cancel"
+            };
+            let hint = if is_spanish {
+                format!("↑↓ acción  Tab escribir rama  Enter confirmar  {esc_hint}")
+            } else {
+                format!("↑↓ action  Tab edit branch  Enter confirm  {esc_hint}")
+            };
+            let block = Block::default()
+                .title(format!("{title} | {hint}"))
+                .title_alignment(ratatui::layout::Alignment::Center)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(warning_border))
+                .style(Style::default().fg(warning_fg).bg(warning_bg));
+            frame.render_widget(block.clone(), area);
+            let inner = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(4), Constraint::Min(4)])
+                .split(block.inner(area));
+            frame.render_widget(
+                Paragraph::new(message)
+                    .wrap(Wrap { trim: true })
+                    .style(Style::default().fg(warning_fg).bg(warning_bg).bold()),
+                inner[0].inner(ratatui::layout::Margin {
+                    horizontal: 2,
+                    vertical: 1,
+                }),
+            );
+            frame.render_widget(
+                List::new(rows).style(Style::default().fg(warning_fg).bg(warning_bg)),
+                inner[1].inner(ratatui::layout::Margin {
+                    horizontal: 2,
+                    vertical: 0,
+                }),
+            );
+        }
         Modal::TextInput { title, value, kind } => {
             let hint = match (lang.trim(), app.onboarding_active) {
                 ("spanish" | "español" | "espanol", true) => "confirmar  Esc atrás",
@@ -1627,52 +1792,51 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
             scroll,
         } => {
             let mut text = String::new();
+            let is_spanish = matches!(lang.trim(), "spanish" | "español" | "espanol");
             let title = match lang.trim() {
                 "spanish" | "español" | "espanol" => "Plan de commits",
                 _ => "Commit plan",
             };
-            let summary_label = match lang.trim() {
-                "spanish" | "español" | "espanol" => "Resumen",
-                _ => "Summary",
+            let files_label = if is_spanish { "Archivos" } else { "Files" };
+            let scope_label = if is_spanish { "Alcance" } else { "Scope" };
+            let scope_value = if app.core.config.staged_only {
+                if is_spanish {
+                    "Solo archivos staged"
+                } else {
+                    "Staged changes only"
+                }
+            } else if is_spanish {
+                "Todos los cambios: staged, unstaged y untracked"
+            } else {
+                "All changes: staged, unstaged, and untracked"
             };
-            let files_label = match lang.trim() {
-                "spanish" | "español" | "espanol" => "Archivos",
-                _ => "Files",
-            };
-            let reason_label = match lang.trim() {
-                "spanish" | "español" | "espanol" => "Criterio",
-                _ => "Reason",
-            };
+            let mut unique_files: Vec<&str> = Vec::new();
+            for group in &plan.groups {
+                for file in &group.files {
+                    if !unique_files.iter().any(|path| *path == file.path) {
+                        unique_files.push(file.path.as_str());
+                    }
+                }
+            }
 
-            text.push_str(&format!("{}: {}\n", summary_label, plan.summary));
+            text.push_str(&format!("{}: {}\n", scope_label, scope_value));
             text.push_str(&format!(
-                "{}: {}\n\n",
-                if matches!(lang.trim(), "spanish" | "español" | "espanol") {
+                "{}: {} | {}: {}\n\n",
+                if is_spanish {
                     "Commits propuestos"
                 } else {
                     "Proposed commits"
                 },
-                plan.groups.len()
+                plan.groups.len(),
+                files_label,
+                unique_files.len()
             ));
 
             for (index, group) in plan.groups.iter().enumerate() {
                 text.push_str(&format!("{}. {}\n", index + 1, group.commit.title()));
-                if !group.commit.body.trim().is_empty() {
-                    text.push_str(&format!("   {}\n", group.commit.body.trim()));
-                }
-                if !group.rationale.trim().is_empty() {
-                    text.push_str(&format!(
-                        "   {}: {}\n",
-                        reason_label,
-                        group.rationale.trim()
-                    ));
-                }
                 text.push_str(&format!("   {}:\n", files_label));
                 for file in &group.files {
-                    text.push_str(&format!(
-                        "   - {} ({}) - {}\n",
-                        file.path, file.status, file.description
-                    ));
+                    text.push_str(&format!("   - {} ({})\n", file.path, file.status));
                 }
                 text.push('\n');
             }
@@ -1697,9 +1861,9 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
 
             let hint = match lang.trim() {
                 "spanish" | "español" | "espanol" => {
-                    "↑↓/PgUp/PgDn scroll  Tab/←→ acción  Enter ejecutar  Esc cancelar"
+                    "↑↓/Tab acción  ←→ acción  PgUp/PgDn scroll  Enter confirmar  Esc cancelar"
                 }
-                _ => "↑↓/PgUp/PgDn scroll  Tab/←→ action  Enter execute  Esc cancel",
+                _ => "↑↓/Tab action  ←→ action  PgUp/PgDn scroll  Enter confirm  Esc cancel",
             };
             let inner_plan = Layout::default()
                 .direction(Direction::Vertical)
@@ -2206,7 +2370,7 @@ fn plain_action_list<T: AsRef<str>>(
             ]))
         })
         .collect::<Vec<_>>();
-    List::new(items)
+    List::new(items).style(Style::default().bg(colors.modal_bg))
 }
 
 fn onboarding_action_list(
@@ -3250,11 +3414,15 @@ fn settings_description(selected: usize, language: &str) -> &'static str {
 }
 
 fn modal_block(title: &str, colors: Palette) -> Block<'_> {
+    modal_block_with_border(title, colors, colors.border)
+}
+
+fn modal_block_with_border(title: &str, colors: Palette, border: Color) -> Block<'_> {
     Block::default()
         .title(title)
         .title_alignment(ratatui::layout::Alignment::Center)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(colors.border))
+        .border_style(Style::default().fg(border))
         .style(Style::default().bg(colors.modal_bg))
 }
 
@@ -3423,7 +3591,8 @@ mod tests {
 
     use super::*;
     use crate::application::{AppCore, OllamaHealth};
-    use crate::domain::{Config, LlmContextUsage};
+    use crate::domain::commit::CommitGroup;
+    use crate::domain::{CommitMessage, CommitPlan, Config, FileEntry, LlmContextUsage};
     use crate::infrastructure::dependencies::PlatformOs;
     use crate::infrastructure::{
         BranchOption, BranchSource, DependencyDoctor, DependencyKind, DependencyState,
@@ -3541,6 +3710,71 @@ mod tests {
             .join("")
     }
 
+    fn commit_plan_with_groups(count: usize) -> CommitPlan {
+        CommitPlan {
+            summary: "grouped changes".to_string(),
+            groups: (0..count)
+                .map(|index| CommitGroup {
+                    commit: CommitMessage {
+                        commit_type: "fix".to_string(),
+                        scope: "tui".to_string(),
+                        subject: format!("compact plan {}", index + 1),
+                        body: "body should not dominate the review modal".to_string(),
+                    },
+                    files: vec![FileEntry {
+                        id: format!("src/file{}.rs", index + 1),
+                        path: format!("src/file{}.rs", index + 1),
+                        status: "modified".to_string(),
+                        description: "test file".to_string(),
+                        patch: None,
+                    }],
+                    rationale: "same change context".to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn commit_plan_review_shows_all_changes_scope() {
+        let mut app = make_app();
+        app.core.config.staged_only = false;
+        app.modal = Some(Modal::CommitPlanReview {
+            plan: commit_plan_with_groups(2),
+            selected: 0,
+            scroll: 0,
+        });
+
+        let text = render_to_text(&app, 120, 28);
+
+        assert!(
+            text.contains("All changes: staged, unstaged, and untracked"),
+            "{text}"
+        );
+        assert!(text.contains("Proposed commits"), "{text}");
+        assert!(text.contains("Files: 2"), "{text}");
+        assert!(text.contains("src/file1.rs (modified)"), "{text}");
+        assert!(text.contains("src/file2.rs (modified)"), "{text}");
+        assert!(!text.contains("Summary"), "{text}");
+        assert!(!text.contains("grouped changes"), "{text}");
+        assert!(!text.contains("same change context"), "{text}");
+        assert!(!text.contains("body should not dominate"), "{text}");
+    }
+
+    #[test]
+    fn commit_plan_review_shows_staged_only_scope() {
+        let mut app = make_app();
+        app.core.config.staged_only = true;
+        app.modal = Some(Modal::CommitPlanReview {
+            plan: commit_plan_with_groups(1),
+            selected: 0,
+            scroll: 0,
+        });
+
+        let text = render_to_text(&app, 120, 28);
+
+        assert!(text.contains("Staged changes only"), "{text}");
+    }
+
     #[test]
     fn long_assistant_message_scrolls_without_truncation_marker() {
         let mut app = make_app();
@@ -3583,6 +3817,18 @@ mod tests {
         assert!(!text.contains("```"), "{text}");
         assert!(!text.contains("`code`"), "{text}");
         assert!(!text.contains("[OpenAI]("), "{text}");
+    }
+
+    #[test]
+    fn scout_mode_labels_assistant_messages_as_scout() {
+        let mut app = make_app();
+        app.execution_mode = ExecutionMode::Scout;
+        app.push_assistant("Scout analysis ready.");
+
+        let text = render_to_text(&app, 100, 18);
+
+        assert!(text.contains("Scout"), "{text}");
+        assert_eq!(text.matches("Autopilot").count(), 1, "{text}");
     }
 
     fn mock_branch_modal() -> Modal {
@@ -3770,6 +4016,24 @@ mod tests {
     }
 
     #[test]
+    fn reset_confirmation_explains_safe_scope() {
+        let mut app = make_app();
+        app.modal = Some(Modal::Confirm {
+            title: "Reset configuration".to_string(),
+            message: crate::ui::state::reset_confirmation_message("English"),
+            selected: 1,
+            kind: crate::ui::state::ConfirmKind::ResetConfiguration,
+        });
+
+        let text = render_to_text(&app, 100, 24);
+
+        assert!(text.contains("Reset configuration"), "{text}");
+        assert!(text.contains("Not deleted: .git"), "{text}");
+        assert!(text.contains("Reset settings"), "{text}");
+        assert!(text.contains("Cancel"), "{text}");
+    }
+
+    #[test]
     fn onboarding_progress_uses_accent_not_warning_for_current_normal_step() {
         let mut app = make_app();
         app.onboarding_active = true;
@@ -3918,7 +4182,9 @@ mod tests {
         ));
 
         assert!(text.contains("Ollama needs model"), "{text}");
-        assert!(text.contains("github auth"), "{text}");
+        assert!(text.contains("PR auth needed"), "{text}");
+        assert!(!text.contains("GitHub needs login"), "{text}");
+        assert!(!text.contains("github auth"), "{text}");
     }
 
     #[test]
@@ -3928,6 +4194,11 @@ mod tests {
         app.core.vram_mb = Some(10 * 1024);
         app.ollama_health = Some(OllamaHealth::ready("0.9.0".to_string()));
         app.dependency_doctor = Some(doctor_with(DependencyState::Ready, DependencyState::Ready));
+        app.last_context_usage = Some(LlmContextUsage {
+            estimated_tokens: 900,
+            limit: 1_000,
+            truncated: true,
+        });
 
         let text = lines_text(&responsive_status_lines(
             &app,
@@ -3941,6 +4212,8 @@ mod tests {
         assert!(!text.contains("GB"), "{text}");
         assert!(!text.contains("MB"), "{text}");
         assert!(!text.contains("Ollama Provider"), "{text}");
+        assert!(!text.contains("Context"), "{text}");
+        assert!(!text.contains("Diff truncated"), "{text}");
     }
 
     #[test]
@@ -3976,15 +4249,16 @@ mod tests {
     fn full_render_shows_commit_busy_message_only_in_input_row() {
         let mut app = make_app();
         app.busy = true;
-        app.busy_message = "Ollama is generating a structured commit plan...".to_string();
+        app.busy_message = "Generating a structured commit plan...".to_string();
         app.ollama_health = Some(OllamaHealth::ready("0.9.0".to_string()));
 
         let text = render_to_text(&app, 100, 24);
         let occurrences = text
-            .matches("Ollama is generating a structured commit plan...")
+            .matches("Generating a structured commit plan...")
             .count();
 
         assert_eq!(occurrences, 1, "{text}");
+        assert!(!text.contains("Ollama is generating"), "{text}");
     }
 
     #[test]

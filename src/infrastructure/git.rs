@@ -160,6 +160,16 @@ impl Git {
         Ok(output)
     }
 
+    pub fn remove_origin_if_exists(&self) -> Result<bool> {
+        if !self.has_origin() {
+            self.invalidate_status_cache();
+            return Ok(false);
+        }
+        self.output(["remote", "remove", "origin"])?;
+        self.invalidate_status_cache();
+        Ok(true)
+    }
+
     pub fn current_branch(&self) -> Result<String> {
         let branch = self.output(["branch", "--show-current"])?;
         let branch = branch.trim();
@@ -286,6 +296,17 @@ impl Git {
                 }
             }
         };
+        self.invalidate_status_cache();
+        Ok(output)
+    }
+
+    pub fn create_and_switch_branch(&self, name: &str) -> Result<String> {
+        self.ensure_repo()?;
+        let branch = name.trim();
+        if branch.is_empty() {
+            return Err(AppError::Custom("Branch name is required.".to_string()));
+        }
+        let output = self.output(["checkout", "-b", branch])?;
         self.invalidate_status_cache();
         Ok(output)
     }
@@ -652,6 +673,12 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {:?} failed", args);
+        if args.first() == Some(&"init") {
+            let _ = Command::new("git")
+                .current_dir(path)
+                .args(["config", "commit.gpgsign", "false"])
+                .status();
+        }
     }
 
     fn git_output_in(path: &Path, args: &[&str]) -> String {
@@ -796,21 +823,24 @@ mod tests {
         );
 
         git_in(dir.path(), &["checkout", "main"]);
-        let remote_root = dir.path().join("remote.git");
         git_in(
             dir.path(),
-            &["init", "--bare", remote_root.to_str().unwrap()],
+            &["remote", "add", "origin", "https://example.com/repo.git"],
         );
         git_in(
             dir.path(),
-            &["remote", "add", "origin", remote_root.to_str().unwrap()],
+            &["update-ref", "refs/remotes/origin/main", "main"],
         );
-        git_in(dir.path(), &["push", "-u", "origin", "main"]);
-        git_in(dir.path(), &["push", "-u", "origin", "alpha"]);
-        git_in(dir.path(), &["push", "-u", "origin", "zeta"]);
+        git_in(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/alpha", "alpha"],
+        );
+        git_in(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/zeta", "zeta"],
+        );
 
         let git = Git::new(dir.path().to_path_buf());
-        git.fetch_origin().unwrap();
         let branches = git.switch_branches().unwrap();
 
         assert_eq!(
@@ -847,21 +877,21 @@ mod tests {
         git_in(dir.path(), &["commit", "-m", "feature"]);
         git_in(dir.path(), &["checkout", "main"]);
 
-        let remote_root = dir.path().join("remote.git");
         git_in(
             dir.path(),
-            &["init", "--bare", remote_root.to_str().unwrap()],
+            &["remote", "add", "origin", "https://example.com/repo.git"],
         );
         git_in(
             dir.path(),
-            &["remote", "add", "origin", remote_root.to_str().unwrap()],
+            &["update-ref", "refs/remotes/origin/main", "main"],
         );
-        git_in(dir.path(), &["push", "-u", "origin", "main"]);
-        git_in(dir.path(), &["push", "-u", "origin", "feature"]);
+        git_in(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/feature", "feature"],
+        );
         git_in(dir.path(), &["branch", "-D", "feature"]);
 
         let git = Git::new(dir.path().to_path_buf());
-        git.fetch_origin().unwrap();
         let remote_feature = git
             .switch_branches()
             .unwrap()

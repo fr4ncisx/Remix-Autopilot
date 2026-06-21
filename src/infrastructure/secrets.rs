@@ -31,6 +31,17 @@ impl SecretsRepository {
         }
     }
 
+    pub fn clear_api_keys() -> Result<()> {
+        for provider in LlmProviderKind::all()
+            .iter()
+            .copied()
+            .filter(|provider| provider.uses_api_key())
+        {
+            Self::save_api_key(provider, "")?;
+        }
+        Ok(())
+    }
+
     fn entry(provider: LlmProviderKind) -> Result<Entry> {
         Entry::new(
             SERVICE_NAME,

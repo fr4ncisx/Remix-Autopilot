@@ -1,3 +1,4 @@
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -5,7 +6,8 @@ use reqwest::Client;
 use tokio::sync::mpsc;
 
 use crate::domain::commit::{
-    commit_plan_prompt, explain_prompt, pr_prompt, review_prompt, scout_question_prompt,
+    CommitGroup, FileEntry, commit_plan_prompt, explain_prompt, pr_prompt, review_prompt,
+    scout_question_prompt,
 };
 use crate::domain::{
     CommitMessage, CommitPlan, Config, DiffContext, Intent, LlmContextUsage, LlmProviderKind,
@@ -138,6 +140,18 @@ impl AppCore {
     pub fn add_origin(&self, url: &str) -> Result<String> {
         self.git.ensure_repo()?;
         self.git.add_origin(url)
+    }
+
+    pub fn reset_safe(&mut self) -> Result<bool> {
+        SecretsRepository::clear_api_keys()?;
+        let removed_origin = if self.git.is_repo() {
+            self.git.remove_origin_if_exists()?
+        } else {
+            false
+        };
+        self.config = Config::default();
+        self.save_config()?;
+        Ok(removed_origin)
     }
 
     pub fn create_github_repo(&self, name: &str, private: bool) -> Result<String> {
@@ -326,7 +340,8 @@ impl AppCore {
                 Some(usage.limit),
             )
             .await?;
-        let plan = CommitPlan::from_llm_response(&response)?;
+        let mut plan = CommitPlan::from_llm_response(&response)?;
+        complete_commit_plan(&mut plan, &context);
         Ok((plan, usage))
     }
 
@@ -362,7 +377,20 @@ impl AppCore {
         self.git.ensure_identity()?;
 
         let mut outputs = Vec::new();
-        for (index, group) in plan.groups.iter().enumerate() {
+        let (max_chars, context_lines) = self.diff_limits();
+        let mut plan = plan.clone();
+        let context = if self.config.staged_only {
+            self.staged_context()?
+        } else {
+            self.git.all_context(max_chars, context_lines)?
+        };
+        complete_commit_plan(&mut plan, &context);
+        dedupe_commit_plan_files(&mut plan);
+
+        for group in &plan.groups {
+            if group.files.is_empty() {
+                continue;
+            }
             self.git.reset_index()?;
 
             let paths = group
@@ -383,7 +411,6 @@ impl AppCore {
                 self.git.apply_patch_to_index(file)?;
             }
 
-            let (max_chars, context_lines) = self.diff_limits();
             let staged = self.git.diff_context(true, max_chars, context_lines)?;
             if staged.is_empty() {
                 let _ = self.git.reset_index();
@@ -394,7 +421,7 @@ impl AppCore {
                 Ok(output) => {
                     outputs.push(format!(
                         "{}. {}",
-                        index + 1,
+                        outputs.len() + 1,
                         if output.trim().is_empty() {
                             group.commit.title()
                         } else {
@@ -407,6 +434,38 @@ impl AppCore {
                     return Err(error);
                 }
             }
+        }
+
+        if !self.config.staged_only && !self.git.all_context(max_chars, context_lines)?.is_empty() {
+            self.git.reset_index()?;
+            self.git.add_all()?;
+            let fallback = CommitMessage {
+                commit_type: "chore".to_string(),
+                scope: String::new(),
+                subject: "include remaining changes".to_string(),
+                body:
+                    "Add files that were still pending after executing the generated commit plan."
+                        .to_string(),
+            };
+            match self.git.commit_index(&fallback) {
+                Ok(output) => outputs.push(format!(
+                    "{}. {}",
+                    outputs.len() + 1,
+                    if output.trim().is_empty() {
+                        fallback.title()
+                    } else {
+                        output
+                    }
+                )),
+                Err(error) => {
+                    let _ = self.git.reset_index();
+                    return Err(error);
+                }
+            }
+        }
+
+        if outputs.is_empty() {
+            return Err(AppError::NoChanges);
         }
 
         Ok(outputs.join("\n"))
@@ -562,6 +621,11 @@ impl AppCore {
     pub fn switch_branch(&self, branch: &BranchOption) -> Result<String> {
         self.ensure_repo()?;
         self.git.switch_to_branch(branch)
+    }
+
+    pub fn create_and_switch_branch(&self, name: &str) -> Result<String> {
+        self.ensure_repo()?;
+        self.git.create_and_switch_branch(name)
     }
 
     pub async fn draft_pr(&mut self, base: &str) -> Result<PullRequestDraft> {
@@ -796,6 +860,119 @@ impl AppCore {
     }
 }
 
+fn complete_commit_plan(plan: &mut CommitPlan, context: &DiffContext) {
+    let changed_files = changed_files_from_status(&context.status);
+    if changed_files.is_empty() {
+        return;
+    }
+
+    let mut planned = plan
+        .groups
+        .iter()
+        .flat_map(|group| group.files.iter())
+        .map(|file| normalize_path_for_compare(&file.path))
+        .collect::<HashSet<_>>();
+
+    let missing = changed_files
+        .into_iter()
+        .filter(|file| planned.insert(normalize_path_for_compare(&file.path)))
+        .collect::<Vec<_>>();
+
+    if missing.is_empty() {
+        return;
+    }
+
+    if let Some(group) = plan.groups.last_mut() {
+        group.files.extend(missing);
+        if group.rationale.trim().is_empty() {
+            group.rationale =
+                "Includes all remaining changed files so the commit plan covers the full working tree."
+                    .to_string();
+        }
+    } else {
+        plan.groups.push(CommitGroup {
+            commit: CommitMessage {
+                commit_type: "chore".to_string(),
+                scope: String::new(),
+                subject: "include remaining changes".to_string(),
+                body: "Commit files that were not assigned to a more specific group.".to_string(),
+            },
+            files: missing,
+            rationale: "Fallback group for changed files not assigned by the model.".to_string(),
+        });
+    }
+}
+
+fn dedupe_commit_plan_files(plan: &mut CommitPlan) {
+    let mut seen = HashSet::new();
+    for group in &mut plan.groups {
+        group
+            .files
+            .retain(|file| seen.insert(normalize_path_for_compare(&file.path)));
+    }
+}
+
+fn changed_files_from_status(status: &str) -> Vec<FileEntry> {
+    status
+        .lines()
+        .filter_map(changed_file_from_status_line)
+        .collect()
+}
+
+fn changed_file_from_status_line(line: &str) -> Option<FileEntry> {
+    let trimmed = line.trim_end();
+    if trimmed.is_empty() {
+        return None;
+    }
+
+    let (code, raw_path) = parse_status_code_and_path(trimmed)?;
+    if raw_path.is_empty() || code == "!!" {
+        return None;
+    }
+
+    let path = raw_path
+        .rsplit_once(" -> ")
+        .map(|(_, new_path)| new_path)
+        .unwrap_or(raw_path)
+        .trim()
+        .trim_matches('"')
+        .to_string();
+    if path.is_empty() {
+        return None;
+    }
+
+    let status = if code == "??" {
+        "untracked"
+    } else if code.contains('D') {
+        "deleted"
+    } else if code.contains('R') {
+        "renamed"
+    } else if code.contains('A') {
+        "added"
+    } else {
+        "modified"
+    };
+
+    Some(FileEntry {
+        id: path.clone(),
+        path: path.clone(),
+        status: status.to_string(),
+        description: "Included automatically because it is present in git status.".to_string(),
+        patch: None,
+    })
+}
+
+fn parse_status_code_and_path(line: &str) -> Option<(&str, &str)> {
+    if line.len() >= 3 && line.as_bytes().get(2).is_some_and(u8::is_ascii_whitespace) {
+        return Some((&line[..2], line[3..].trim()));
+    }
+    line.split_once(char::is_whitespace)
+}
+
+fn normalize_path_for_compare(path: &str) -> String {
+    path.trim().trim_matches('"').replace('\\', "/")
+}
+
 fn detect_ollama_installation() -> std::result::Result<String, String> {
     let output = Command::new("ollama")
         .arg("--version")
@@ -835,7 +1012,7 @@ pub fn help_text(language: &str) -> String {
         "spanish" | "español" | "espanol" => [
             "Usa comandos slash:",
             "/commit, /switch, /diff, /provider, /model, /lang, /staged, /push",
-            "/pr, /pull-request, /explain, /review, /setup, /theme, /config, /help, /exit",
+            "/pr, /pull-request, /explain, /review, /setup, /theme, /config, /reset, /resolve, /help, /exit",
             "",
             "Teclas: F2 configuración, Shift+Tab cambiar modo, / comandos, Enter enviar, Esc cancelar",
         ]
@@ -843,7 +1020,7 @@ pub fn help_text(language: &str) -> String {
         _ => [
             "Use slash commands:",
             "/commit, /switch, /diff, /provider, /model, /lang, /staged, /push",
-            "/pr, /pull-request, /explain, /review, /setup, /theme, /config, /help, /exit",
+            "/pr, /pull-request, /explain, /review, /setup, /theme, /config, /reset, /resolve, /help, /exit",
             "",
             "Keys: F2 settings, Shift+Tab switch mode, / commands, Enter send, Esc cancel",
         ]
@@ -856,11 +1033,37 @@ mod tests {
     use super::*;
     use crate::domain::DiffContext;
     use reqwest::Client;
+    use std::fs;
     use std::path::PathBuf;
+    use std::process::Command;
+    use tempfile::tempdir;
 
     fn make_core() -> AppCore {
         let config = crate::domain::Config::default();
         AppCore::new(PathBuf::from("."), config, Client::new())
+    }
+
+    fn git_in(dir: &std::path::Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
+        assert!(status.success(), "git {args:?} failed");
+    }
+
+    fn git_output_in(dir: &std::path::Path, args: &[&str]) -> String {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .output()
+            .unwrap_or_else(|error| panic!("failed to run git {args:?}: {error}"));
+        assert!(
+            output.status.success(),
+            "git {args:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8_lossy(&output.stdout).to_string()
     }
 
     #[test]
@@ -925,6 +1128,221 @@ mod tests {
         let warning = context.truncation_warning("English");
         assert!(warning.contains("WARNING"));
         assert!(warning.contains("truncated"));
+    }
+
+    #[test]
+    fn complete_commit_plan_adds_changed_files_missing_from_model_output() {
+        let mut plan = CommitPlan {
+            summary: "Plan".to_string(),
+            groups: vec![CommitGroup {
+                commit: CommitMessage {
+                    commit_type: "feat".to_string(),
+                    scope: String::new(),
+                    subject: "update tracked file".to_string(),
+                    body: String::new(),
+                },
+                files: vec![FileEntry {
+                    id: "src/app.rs".to_string(),
+                    path: "src/app.rs".to_string(),
+                    status: "modified".to_string(),
+                    description: "Updated app".to_string(),
+                    patch: None,
+                }],
+                rationale: String::new(),
+            }],
+        };
+        let context = DiffContext {
+            status: " M src/app.rs\n?? README.md\nA  src/new.rs\n".to_string(),
+            ..Default::default()
+        };
+
+        complete_commit_plan(&mut plan, &context);
+
+        let paths = plan.groups[0]
+            .files
+            .iter()
+            .map(|file| file.path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["src/app.rs", "README.md", "src/new.rs"]);
+    }
+
+    #[test]
+    fn execute_commit_plan_commits_tracked_and_untracked_files_without_leftovers() {
+        let dir = tempdir().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        git_in(dir.path(), &["config", "user.name", "Test User"]);
+        git_in(dir.path(), &["config", "user.email", "test@example.com"]);
+        git_in(dir.path(), &["config", "commit.gpgsign", "false"]);
+
+        fs::write(dir.path().join("tracked.txt"), "before\n").unwrap();
+        git_in(dir.path(), &["add", "tracked.txt"]);
+        git_in(dir.path(), &["commit", "-m", "base"]);
+
+        fs::write(dir.path().join("tracked.txt"), "after\n").unwrap();
+        fs::write(dir.path().join("untracked.txt"), "new\n").unwrap();
+
+        let core = AppCore::new(
+            dir.path().to_path_buf(),
+            crate::domain::Config::default(),
+            Client::new(),
+        );
+        let plan = CommitPlan {
+            summary: String::new(),
+            groups: vec![CommitGroup {
+                commit: CommitMessage {
+                    commit_type: "fix".to_string(),
+                    scope: String::new(),
+                    subject: "update tracked file".to_string(),
+                    body: String::new(),
+                },
+                files: vec![FileEntry {
+                    id: "tracked.txt".to_string(),
+                    path: "tracked.txt".to_string(),
+                    status: "modified".to_string(),
+                    description: String::new(),
+                    patch: None,
+                }],
+                rationale: String::new(),
+            }],
+        };
+
+        core.execute_commit_plan(&plan).unwrap();
+
+        assert_eq!(git_output_in(dir.path(), &["status", "--porcelain"]), "");
+        assert!(git_output_in(dir.path(), &["log", "--oneline"]).contains("update tracked file"));
+    }
+
+    #[test]
+    fn execute_commit_plan_respects_staged_only_scope() {
+        let dir = tempdir().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        git_in(dir.path(), &["config", "user.name", "Test User"]);
+        git_in(dir.path(), &["config", "user.email", "test@example.com"]);
+        git_in(dir.path(), &["config", "commit.gpgsign", "false"]);
+
+        fs::write(dir.path().join("staged.txt"), "before\n").unwrap();
+        fs::write(dir.path().join("unstaged.txt"), "before\n").unwrap();
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "base"]);
+
+        fs::write(dir.path().join("staged.txt"), "after\n").unwrap();
+        fs::write(dir.path().join("unstaged.txt"), "after\n").unwrap();
+        fs::write(dir.path().join("untracked.txt"), "new\n").unwrap();
+        git_in(dir.path(), &["add", "staged.txt"]);
+
+        let config = crate::domain::Config {
+            staged_only: true,
+            ..Default::default()
+        };
+        let core = AppCore::new(dir.path().to_path_buf(), config, Client::new());
+        let plan = CommitPlan {
+            summary: String::new(),
+            groups: vec![CommitGroup {
+                commit: CommitMessage {
+                    commit_type: "fix".to_string(),
+                    scope: String::new(),
+                    subject: "commit staged file".to_string(),
+                    body: String::new(),
+                },
+                files: vec![FileEntry {
+                    id: "staged.txt".to_string(),
+                    path: "staged.txt".to_string(),
+                    status: "modified".to_string(),
+                    description: String::new(),
+                    patch: None,
+                }],
+                rationale: String::new(),
+            }],
+        };
+
+        core.execute_commit_plan(&plan).unwrap();
+
+        let status = git_output_in(dir.path(), &["status", "--porcelain"]);
+        let status_lines = status.lines().collect::<Vec<_>>();
+        assert!(status_lines.contains(&" M unstaged.txt"), "{status}");
+        assert!(status_lines.contains(&"?? untracked.txt"), "{status}");
+        assert!(
+            !status_lines
+                .iter()
+                .any(|line| line.ends_with("staged.txt") && !line.ends_with("unstaged.txt")),
+            "{status}"
+        );
+    }
+
+    #[test]
+    fn execute_commit_plan_skips_duplicate_files_in_later_groups() {
+        let dir = tempdir().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        git_in(dir.path(), &["config", "user.name", "Test User"]);
+        git_in(dir.path(), &["config", "user.email", "test@example.com"]);
+        git_in(dir.path(), &["config", "commit.gpgsign", "false"]);
+
+        fs::write(dir.path().join("shared.txt"), "before\n").unwrap();
+        git_in(dir.path(), &["add", "shared.txt"]);
+        git_in(dir.path(), &["commit", "-m", "base"]);
+        fs::write(dir.path().join("shared.txt"), "after\n").unwrap();
+
+        let core = AppCore::new(
+            dir.path().to_path_buf(),
+            crate::domain::Config::default(),
+            Client::new(),
+        );
+        let duplicate = FileEntry {
+            id: "shared.txt".to_string(),
+            path: "shared.txt".to_string(),
+            status: "modified".to_string(),
+            description: String::new(),
+            patch: None,
+        };
+        let plan = CommitPlan {
+            summary: String::new(),
+            groups: vec![
+                CommitGroup {
+                    commit: CommitMessage {
+                        commit_type: "fix".to_string(),
+                        scope: String::new(),
+                        subject: "first group".to_string(),
+                        body: String::new(),
+                    },
+                    files: vec![duplicate.clone()],
+                    rationale: String::new(),
+                },
+                CommitGroup {
+                    commit: CommitMessage {
+                        commit_type: "chore".to_string(),
+                        scope: String::new(),
+                        subject: "duplicate group".to_string(),
+                        body: String::new(),
+                    },
+                    files: vec![duplicate],
+                    rationale: String::new(),
+                },
+            ],
+        };
+
+        let output = core.execute_commit_plan(&plan).unwrap();
+
+        assert!(output.contains("first group"), "{output}");
+        assert!(!output.contains("duplicate group"), "{output}");
+        assert_eq!(git_output_in(dir.path(), &["status", "--porcelain"]), "");
+    }
+
+    #[test]
+    fn changed_files_from_status_handles_renames_and_untracked_files() {
+        let files = changed_files_from_status("R  old.rs -> new.rs\n?? docs/guide.md\n D gone.rs");
+        let paths = files
+            .iter()
+            .map(|file| (file.path.as_str(), file.status.as_str()))
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            paths,
+            vec![
+                ("new.rs", "renamed"),
+                ("docs/guide.md", "untracked"),
+                ("gone.rs", "deleted")
+            ]
+        );
     }
 
     #[test]

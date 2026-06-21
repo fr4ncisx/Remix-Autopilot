@@ -17,6 +17,8 @@ pub enum Intent {
     Review,
     Setup,
     Theme,
+    Reset,
+    Resolve,
 }
 
 #[derive(Debug, Clone)]
@@ -75,7 +77,6 @@ pub fn slash_suggestions(input: &str) -> Vec<Suggestion> {
             .cmp(&left.score)
             .then_with(|| left.command.cmp(right.command))
     });
-    suggestions.truncate(8);
     suggestions
 }
 
@@ -178,6 +179,16 @@ fn command_specs() -> Vec<CommandSpec> {
             intent: Intent::Theme,
         },
         CommandSpec {
+            command: "/reset",
+            description: "reset configuration and disconnect origin safely",
+            intent: Intent::Reset,
+        },
+        CommandSpec {
+            command: "/resolve",
+            description: "resolve the next pending setup or dependency issue",
+            intent: Intent::Resolve,
+        },
+        CommandSpec {
             command: "/config",
             description: "open interactive settings",
             intent: Intent::Config,
@@ -246,6 +257,14 @@ mod tests {
             IntentParser::parse("/pull-request"),
             IntentDecision::Certain(Intent::Pr)
         ));
+        assert!(matches!(
+            IntentParser::parse("/reset"),
+            IntentDecision::Certain(Intent::Reset)
+        ));
+        assert!(matches!(
+            IntentParser::parse("/resolve"),
+            IntentDecision::Certain(Intent::Resolve)
+        ));
     }
 
     #[test]
@@ -283,6 +302,9 @@ mod tests {
 
         let suggestions = slash_suggestions("/sw");
         assert_eq!(suggestions[0].command, "/switch");
+
+        let suggestions = slash_suggestions("/res");
+        assert!(matches!(suggestions[0].command, "/reset" | "/resolve"));
     }
 
     #[test]
@@ -306,5 +328,15 @@ mod tests {
                 .iter()
                 .all(|item| item.command != "/dry-run")
         );
+    }
+
+    #[test]
+    fn bare_slash_lists_all_available_commands() {
+        let suggestions = slash_suggestions("/");
+        assert!(suggestions.len() > 8);
+        assert!(suggestions.iter().any(|item| item.command == "/commit"));
+        assert!(suggestions.iter().any(|item| item.command == "/config"));
+        assert!(suggestions.iter().any(|item| item.command == "/resolve"));
+        assert!(suggestions.iter().any(|item| item.command == "/exit"));
     }
 }

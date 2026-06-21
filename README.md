@@ -235,6 +235,8 @@ press `Tab` to autocomplete it.
 | `/setup`        | Initialize Git, add `origin`, or create a GitHub repository.                                         |
 | `/theme`        | Change the color theme.                                                                              |
 | `/config`       | Open interactive settings, or onboarding if required.                                                |
+| `/reset`        | Reset app configuration, API keys, and `origin` without deleting `.git` or local files.               |
+| `/resolve`      | Open the next pending setup, provider, or dependency issue in an actionable modal.                    |
 | `/help`         | Show in-app help.                                                                                    |
 | `/exit`         | Quit the application.                                                                                |
 
@@ -384,6 +386,21 @@ The app currently supports these themes:
 - `Dracula`
 - `HighContrast`
 - `Light`
+
+### Reset configuration
+
+Use `/reset` when you want to return Remix Autopilot to the first-run setup
+flow. The command opens a confirmation modal before it changes anything.
+
+The safe reset removes:
+
+- The selected AI provider, model, base URL, and saved global preferences.
+- API keys stored in the OS secret store for API-backed providers.
+- The `origin` remote from the current Git repository, if one exists.
+
+The safe reset doesn't remove `.git`, commits, branches, local files, or remote
+history. After the reset completes, onboarding opens again so you can configure
+the app from the beginning.
 
 This is an example of the default config shape:
 
