@@ -506,12 +506,12 @@ fn no_json_error(context: &str, response: &str) -> String {
     let preview = sanitize_llm_preview(response);
     if preview.is_empty() {
         format!(
-            "Ollama returned no valid JSON for the {}. Try Regenerate or switch models.",
+            "The selected AI provider returned no valid JSON for the {}. Try Regenerate or switch models.",
             context
         )
     } else {
         format!(
-            "Ollama returned no valid JSON for the {}. Try Regenerate or switch models.\nPreview: {}",
+            "The selected AI provider returned no valid JSON for the {}. Try Regenerate or switch models.\nPreview: {}",
             context, preview
         )
     }
@@ -535,7 +535,7 @@ fn sanitize_llm_preview(response: &str) -> String {
 fn malformed_commit_plan_json_error(source: serde_json::Error, json: &str) -> String {
     let preview = sanitize_llm_preview(json);
     format!(
-        "Ollama returned malformed commit-plan JSON: {}. Try Regenerate, /staged, or another model. Preview: {}",
+        "The selected AI provider returned malformed commit-plan JSON: {}. Try Regenerate, /staged, or another model. Preview: {}",
         source, preview
     )
 }
@@ -818,7 +818,7 @@ mod tests {
         let AppError::InvalidLlmResponse(message) = error else {
             panic!("expected invalid LLM response");
         };
-        assert!(message.contains("Ollama returned malformed commit-plan JSON"));
+        assert!(message.contains("The selected AI provider returned malformed commit-plan JSON"));
         assert!(message.contains("Try Regenerate, /staged, or another model"));
         assert!(message.chars().count() < 420);
     }
@@ -831,7 +831,9 @@ mod tests {
         let AppError::InvalidLlmResponse(message) = error else {
             panic!("expected invalid LLM response");
         };
-        assert!(message.contains("Ollama returned no valid JSON for the commit plan"));
+        assert!(
+            message.contains("The selected AI provider returned no valid JSON for the commit plan")
+        );
         assert!(message.contains("Try Regenerate or switch models"));
         assert!(message.contains("Preview: Sure"));
     }
