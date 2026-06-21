@@ -102,7 +102,7 @@ impl Git {
     }
 
     pub fn status(&self) -> RepoStatus {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().expect("git status cache lock poisoned");
         if let Some((status, time)) = &cache.status
             && time.elapsed() < cache.status_ttl
         {
@@ -236,10 +236,7 @@ impl Git {
         let patch_with_header = if patch.starts_with("--- ") {
             patch.to_string()
         } else {
-            format!(
-                "--- a/{}\n+++ b/{}\n{}",
-                file_path, file_path, patch
-            )
+            format!("--- a/{}\n+++ b/{}\n{}", file_path, file_path, patch)
         };
 
         let mut child = Command::new("git")
@@ -252,9 +249,11 @@ impl Git {
             .map_err(|_| AppError::GitMissing)?;
 
         if let Some(stdin) = child.stdin.as_mut() {
-            stdin.write_all(patch_with_header.as_bytes()).map_err(|error| {
-                AppError::Custom(format!("failed to write patch to git: {}", error))
-            })?;
+            stdin
+                .write_all(patch_with_header.as_bytes())
+                .map_err(|error| {
+                    AppError::Custom(format!("failed to write patch to git: {}", error))
+                })?;
         }
 
         let output = child
@@ -386,7 +385,7 @@ impl Git {
     }
 
     fn invalidate_status_cache(&self) {
-        self.cache.lock().unwrap().status = None;
+        self.cache.lock().expect("git cache lock poisoned").status = None;
     }
 
     pub fn diff_context(

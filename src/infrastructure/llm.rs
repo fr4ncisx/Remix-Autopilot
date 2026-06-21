@@ -220,7 +220,10 @@ impl LlmClient {
                         status: response.status().as_u16(),
                     });
                 }
-                Ok(provider.model.unwrap().to_string())
+                let model = provider.model.ok_or_else(|| AppError::MissingModel {
+                    provider: provider.provider.label().to_string(),
+                })?;
+                Ok(model.to_string())
             }
             LlmProviderKind::Gemini => {
                 let response = self
@@ -228,7 +231,9 @@ impl LlmClient {
                     .get(format!(
                         "{}/models/{}?key={}",
                         provider.base_url,
-                        provider.model.unwrap(),
+                        provider.model.ok_or_else(|| AppError::MissingModel {
+                            provider: provider.provider.label().to_string(),
+                        })?,
                         provider.api_key.unwrap_or_default()
                     ))
                     .send()
@@ -243,7 +248,10 @@ impl LlmClient {
                         status: response.status().as_u16(),
                     });
                 }
-                Ok(provider.model.unwrap().to_string())
+                let model = provider.model.ok_or_else(|| AppError::MissingModel {
+                    provider: provider.provider.label().to_string(),
+                })?;
+                Ok(model.to_string())
             }
             LlmProviderKind::Anthropic => {
                 let response = self
@@ -263,7 +271,10 @@ impl LlmClient {
                         status: response.status().as_u16(),
                     });
                 }
-                Ok(provider.model.unwrap().to_string())
+                let model = provider.model.ok_or_else(|| AppError::MissingModel {
+                    provider: provider.provider.label().to_string(),
+                })?;
+                Ok(model.to_string())
             }
         }
     }

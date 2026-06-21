@@ -88,6 +88,13 @@ pub struct PrInfo {
     pub number: i64,
     pub title: String,
     pub url: String,
+    pub author: Option<PrAuthor>,
+    pub body: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct PrAuthor {
+    pub login: String,
 }
 
 impl PullRequestDraft {
@@ -908,5 +915,125 @@ mod tests {
     #[test]
     fn strips_emoji_from_generated_text() {
         assert_eq!(strip_emoji("fix bug ✅"), "fix bug ");
+    }
+
+    #[test]
+    fn pull_request_draft_from_valid_json() {
+        let response =
+            r#"{"title": "feat: add dark mode", "body": "- Added toggle\n- Updated theme"}"#;
+        let draft = PullRequestDraft::from_llm_response(response).unwrap();
+        assert_eq!(draft.title, "feat: add dark mode");
+        assert!(draft.body.contains("Added toggle"));
+    }
+
+    #[test]
+    fn pull_request_draft_strips_emoji() {
+        let response = r#"{"title": "✨ feat: add feature", "body": "🚀 New feature added"}"#;
+        let draft = PullRequestDraft::from_llm_response(response).unwrap();
+        assert!(!draft.title.contains('✨'));
+        assert!(!draft.body.contains('🚀'));
+    }
+
+    #[test]
+    fn pull_request_draft_rejects_empty_title() {
+        let response = r#"{"title": "", "body": "some body"}"#;
+        let result = PullRequestDraft::from_llm_response(response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pull_request_draft_rejects_empty_body() {
+        let response = r#"{"title": "some title", "body": ""}"#;
+        let result = PullRequestDraft::from_llm_response(response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn pull_request_draft_rejects_no_json() {
+        let response = "Here is the PR draft without any JSON.";
+        let result = PullRequestDraft::from_llm_response(response);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn llm_context_usage_percent_basic() {
+        let usage = LlmContextUsage {
+            estimated_tokens: 500,
+            limit: 2000,
+            truncated: false,
+        };
+        assert_eq!(usage.percent(), Some(25));
+    }
+
+    #[test]
+    fn llm_context_usage_percent_zero_limit() {
+        let usage = LlmContextUsage {
+            estimated_tokens: 100,
+            limit: 0,
+            truncated: false,
+        };
+        assert_eq!(usage.percent(), None);
+    }
+
+    #[test]
+    fn llm_context_usage_percent_near_limit() {
+        let usage = LlmContextUsage {
+            estimated_tokens: 1999,
+            limit: 2000,
+            truncated: false,
+        };
+        assert_eq!(usage.percent(), Some(99));
+    }
+
+    #[test]
+    fn llm_context_usage_percent_capped_at_100() {
+        let usage = LlmContextUsage {
+            estimated_tokens: 5000,
+            limit: 2000,
+            truncated: true,
+        };
+        assert_eq!(usage.percent(), Some(100));
+    }
+
+    #[test]
+    fn commit_plan_prompt_includes_language() {
+        let context = DiffContext::default();
+        let prompt = commit_plan_prompt("Spanish", &context);
+        assert!(prompt.contains("Spanish"));
+        assert!(prompt.contains("commit-plan"));
+    }
+
+    #[test]
+    fn scout_question_prompt_includes_question() {
+        let context = DiffContext::default();
+        let prompt = scout_question_prompt("English", &context, "Why was this changed?");
+        assert!(prompt.contains("Why was this changed?"));
+        assert!(prompt.contains("English"));
+    }
+
+    #[test]
+    fn resolve_conflict_prompt_includes_file_and_conflict() {
+        let prompt = resolve_conflict_prompt(
+            "Rust",
+            "src/main.rs",
+            "<<<<<<< HEAD\nfoo\n=======\nbar\n>>>>>>> branch",
+        );
+        assert!(prompt.contains("src/main.rs"));
+        assert!(prompt.contains("<<<<<<< HEAD"));
+        assert!(prompt.contains("Rust"));
+    }
+
+    #[test]
+    fn explain_prompt_includes_language() {
+        let context = DiffContext::default();
+        let prompt = explain_prompt("Spanish", &context);
+        assert!(prompt.contains("Spanish"));
+    }
+
+    #[test]
+    fn review_prompt_includes_language() {
+        let context = DiffContext::default();
+        let prompt = review_prompt("English", &context);
+        assert!(prompt.contains("English"));
     }
 }

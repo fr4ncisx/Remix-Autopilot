@@ -6,8 +6,8 @@ use reqwest::Client;
 use tokio::sync::mpsc;
 
 use crate::domain::commit::{
-    CommitGroup, FileEntry, commit_plan_prompt, explain_prompt, pr_prompt,
-    resolve_conflict_prompt, review_prompt, scout_question_prompt, status_prompt,
+    CommitGroup, FileEntry, commit_plan_prompt, explain_prompt, pr_prompt, resolve_conflict_prompt,
+    review_prompt, scout_question_prompt, status_prompt,
 };
 use crate::domain::{
     CommitMessage, CommitPlan, Config, DiffContext, Intent, LlmContextUsage, LlmProviderKind,
@@ -773,7 +773,10 @@ impl AppCore {
         }
 
         let model = self.ensure_model().await?;
-        let commits = self.git.commit_log_between(base, &current).unwrap_or_default();
+        let commits = self
+            .git
+            .commit_log_between(base, &current)
+            .unwrap_or_default();
         let commits_text = commits
             .iter()
             .map(|c| format!("{} - {}", c.short_hash, c.subject))
@@ -820,7 +823,15 @@ impl AppCore {
         let model = self.ensure_model().await?;
         let prompt = resolve_conflict_prompt(&self.config.language, file, &conflict);
         let num_ctx = self.calculate_num_ctx(prompt.len());
-        self.llm.generate(&self.config, self.api_key()?.as_deref(), &model, &prompt, num_ctx).await
+        self.llm
+            .generate(
+                &self.config,
+                self.api_key()?.as_deref(),
+                &model,
+                &prompt,
+                num_ctx,
+            )
+            .await
     }
 
     pub fn current_branch(&self) -> Result<String> {
