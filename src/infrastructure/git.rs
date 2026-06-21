@@ -225,12 +225,22 @@ impl Git {
         self.output(["reset", "-q"])
     }
 
-    pub fn apply_patch_to_index(&self, patch: &str) -> Result<String> {
-        if patch.trim().is_empty() {
+    pub fn apply_patch_to_index(&self, file_path: &str, patch: &str) -> Result<String> {
+        let patch = patch.trim();
+        if patch.is_empty() {
             return Err(AppError::Custom(
                 "commit group patch cannot be empty".to_string(),
             ));
         }
+
+        let patch_with_header = if patch.starts_with("--- ") {
+            patch.to_string()
+        } else {
+            format!(
+                "--- a/{}\n+++ b/{}\n{}",
+                file_path, file_path, patch
+            )
+        };
 
         let mut child = Command::new("git")
             .current_dir(&self.cwd)
@@ -242,7 +252,7 @@ impl Git {
             .map_err(|_| AppError::GitMissing)?;
 
         if let Some(stdin) = child.stdin.as_mut() {
-            stdin.write_all(patch.as_bytes()).map_err(|error| {
+            stdin.write_all(patch_with_header.as_bytes()).map_err(|error| {
                 AppError::Custom(format!("failed to write patch to git: {}", error))
             })?;
         }
@@ -286,6 +296,30 @@ impl Git {
             &limit,
         ])?;
         Ok(parse_commit_log(&output))
+    }
+
+    pub fn commit_log_between(&self, base: &str, head: &str) -> Result<Vec<CommitLogEntry>> {
+        let range = format!("{}..{}", base, head);
+        let output = self.output([
+            "log",
+            "--date=relative",
+            "--decorate=short",
+            "--format=%H%x1f%h%x1f%D%x1f%s%x1f%an%x1f%cr",
+            &range,
+        ])?;
+        Ok(parse_commit_log(&output))
+    }
+
+    pub fn can_merge(&self, base: &str) -> bool {
+        let status = Command::new("git")
+            .current_dir(&self.cwd)
+            .args(["merge", "--no-commit", "--no-ff", "--dry-run", base])
+            .status();
+
+        match status {
+            Ok(s) => s.success(),
+            Err(_) => false,
+        }
     }
 
     pub fn reset_soft_to(&self, hash: &str) -> Result<String> {
