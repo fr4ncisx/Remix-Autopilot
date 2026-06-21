@@ -745,12 +745,15 @@ impl AppCore {
     pub async fn draft_pr(&mut self, base: &str) -> Result<PullRequestDraft> {
         let current = self.git.current_branch()?;
         let (max_chars, context_lines) = self.diff_limits();
-        let context = if self.config.staged_only {
-            self.staged_context()?
-        } else {
-            self.git.all_context(max_chars, context_lines)?
-        };
-        if context.is_empty() {
+
+        let commits = self
+            .git
+            .commit_log_between(base, &current)
+            .unwrap_or_default();
+
+        let context = self.git.diff_between(base, &current, max_chars, context_lines)?;
+
+        if context.status.trim().is_empty() && commits.is_empty() {
             return Ok(PullRequestDraft {
                 title: format!("Merge {}", current),
                 body: "Automated pull request created by Remix Autopilot.".to_string(),
@@ -773,10 +776,6 @@ impl AppCore {
         }
 
         let model = self.ensure_model().await?;
-        let commits = self
-            .git
-            .commit_log_between(base, &current)
-            .unwrap_or_default();
         let commits_text = commits
             .iter()
             .map(|c| format!("{} - {}", c.short_hash, c.subject))
@@ -834,6 +833,7 @@ impl AppCore {
             .await
     }
 
+    #[allow(dead_code)]
     pub fn current_branch(&self) -> Result<String> {
         self.git.current_branch()
     }

@@ -312,13 +312,36 @@ impl Git {
     pub fn can_merge(&self, base: &str) -> bool {
         let status = Command::new("git")
             .current_dir(&self.cwd)
-            .args(["merge", "--no-commit", "--no-ff", "--dry-run", base])
+            .args(["merge-tree", base, "HEAD"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
             .status();
 
         match status {
             Ok(s) => s.success(),
             Err(_) => false,
         }
+    }
+
+    pub fn diff_between(
+        &self,
+        base: &str,
+        head: &str,
+        max_chars: usize,
+        context_lines: u32,
+    ) -> Result<DiffContext> {
+        let u_arg = format!("-U{}", context_lines);
+        let range = format!("{}...{}", base, head);
+        let status = self.output(["diff", "--name-status", &range])?;
+        let stat = self.output(["diff", "--stat", &range])?;
+        let diff = self.output(["diff", &u_arg, &range])?;
+        let (diff, truncated) = truncate_diff(diff, max_chars);
+        Ok(DiffContext {
+            status,
+            stat,
+            diff,
+            truncated,
+        })
     }
 
     pub fn reset_soft_to(&self, hash: &str) -> Result<String> {
@@ -1078,5 +1101,37 @@ mod tests {
             &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
         );
         assert_eq!(upstream, "origin/feature");
+    }
+
+    #[test]
+    fn test_can_merge_and_diff_between() {
+        let dir = tempdir().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        git_in(dir.path(), &["config", "user.name", "Tester"]);
+        git_in(dir.path(), &["config", "user.email", "tester@example.com"]);
+        write_file(dir.path(), "file.txt", "base content\n");
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "commit 1"]);
+
+        git_in(dir.path(), &["checkout", "-b", "feature"]);
+        write_file(dir.path(), "file.txt", "base content\nfeature content\n");
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "commit 2"]);
+
+        let git = Git::new(dir.path().to_path_buf());
+        assert!(git.can_merge("main"));
+
+        let diff = git.diff_between("main", "feature", 1000, 3).unwrap();
+        assert!(diff.status.contains("M\tfile.txt") || diff.status.contains("M file.txt"));
+        assert!(diff.diff.contains("+feature content"));
+
+        // Create conflict
+        git_in(dir.path(), &["checkout", "main"]);
+        write_file(dir.path(), "file.txt", "conflicting content\n");
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "commit 3"]);
+
+        git_in(dir.path(), &["checkout", "feature"]);
+        assert!(!git.can_merge("main"));
     }
 }
