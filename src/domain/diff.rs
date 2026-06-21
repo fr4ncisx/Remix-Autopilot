@@ -11,6 +11,40 @@ impl DiffContext {
         self.status.trim().is_empty() && self.stat.trim().is_empty() && self.diff.trim().is_empty()
     }
 
+    pub fn file_line_stats(&self) -> std::collections::HashMap<String, (usize, usize)> {
+        let mut stats = std::collections::HashMap::new();
+        let mut current_file = None;
+
+        for line in self.diff.lines() {
+            if line.starts_with("diff --git ") {
+                if let Some(pos) = line.find(" b/") {
+                    let file = line[pos + 3..].to_string();
+                    current_file = Some(file.clone());
+                    stats.entry(file).or_insert((0, 0));
+                }
+            } else if let Some(path) = line.strip_prefix("+++ b/") {
+                let path = path.trim().to_string();
+                if path != "/dev/null" {
+                    current_file = Some(path.clone());
+                    stats.entry(path).or_insert((0, 0));
+                }
+            } else if let Some(path) = line.strip_prefix("--- a/") {
+                let path = path.trim().to_string();
+                if path != "/dev/null" {
+                    current_file = Some(path.clone());
+                    stats.entry(path).or_insert((0, 0));
+                }
+            } else if let Some(cf) = &current_file {
+                if line.starts_with('+') && !line.starts_with("+++") {
+                    stats.entry(cf.clone()).and_modify(|(add, _)| *add += 1).or_insert((1, 0));
+                } else if line.starts_with('-') && !line.starts_with("---") {
+                    stats.entry(cf.clone()).and_modify(|(_, del)| *del += 1).or_insert((0, 1));
+                }
+            }
+        }
+        stats
+    }
+
     pub fn truncation_warning(&self, language: &str) -> String {
         if !self.truncated {
             return String::new();
@@ -22,124 +56,6 @@ impl DiffContext {
         }
     }
 
-    pub fn summary(&self, language: &str) -> String {
-        let mut output = String::new();
-        if !self.status.trim().is_empty() {
-            output.push_str(&humanized_status(&self.status, language));
-            output.push('\n');
-        }
-        if !self.stat.trim().is_empty() {
-            output.push_str(self.stat.trim());
-            output.push('\n');
-        }
-        if self.truncated {
-            let lang = language.to_lowercase();
-            let warning = match lang.trim() {
-                "spanish" | "español" | "espanol" => {
-                    "\n[ADVERTENCIA: Los cambios detallados (diff) fueron truncados debido al límite de tamaño de la ventana de contexto.]"
-                }
-                _ => {
-                    "\n[WARNING: Detailed changes (diff) were truncated due to context size limits.]"
-                }
-            };
-            output.push_str(warning);
-        }
-        output.trim().to_string()
-    }
-}
-
-pub fn humanized_status(status: &str, language: &str) -> String {
-    let spanish = matches!(
-        language.to_lowercase().trim(),
-        "spanish" | "español" | "espanol"
-    );
-    status
-        .lines()
-        .filter_map(|line| humanize_status_line(line, spanish))
-        .collect::<Vec<_>>()
-        .join("\n")
-}
-
-fn humanize_status_line(line: &str, spanish: bool) -> Option<String> {
-    let trimmed = line.trim_end();
-    if trimmed.is_empty() {
-        return None;
-    }
-
-    let (code, path) = if trimmed.len() >= 3 {
-        trimmed.split_at(2)
-    } else {
-        (trimmed, "")
-    };
-    let path = path.trim();
-    let label = match code {
-        "??" => {
-            if spanish {
-                "sin tracking"
-            } else {
-                "untracked"
-            }
-        }
-        "!!" => {
-            if spanish {
-                "ignorado"
-            } else {
-                "ignored"
-            }
-        }
-        " M" | "M " | "MM" => {
-            if spanish {
-                "modificado"
-            } else {
-                "modified"
-            }
-        }
-        "A " | " A" | "AM" => {
-            if spanish {
-                "agregado"
-            } else {
-                "added"
-            }
-        }
-        "D " | " D" | "MD" => {
-            if spanish {
-                "eliminado"
-            } else {
-                "deleted"
-            }
-        }
-        "R " | " R" | "RM" => {
-            if spanish {
-                "renombrado"
-            } else {
-                "renamed"
-            }
-        }
-        "C " | " C" => {
-            if spanish {
-                "copiado"
-            } else {
-                "copied"
-            }
-        }
-        "UU" | "AA" | "DD" | "AU" | "UA" | "DU" | "UD" => {
-            if spanish {
-                "conflicto"
-            } else {
-                "conflict"
-            }
-        }
-        _ => {
-            if spanish {
-                "cambiado"
-            } else {
-                "changed"
-            }
-        }
-    };
-
-    let path = if path.is_empty() { trimmed } else { path };
-    Some(format!("- {}: {}", label, path))
 }
 
 pub fn truncate_diff(diff: String, max_chars: usize) -> (String, bool) {
@@ -168,17 +84,31 @@ mod tests {
         assert!(!truncated);
     }
 
+
+
     #[test]
-    fn summary_humanizes_untracked_status() {
+    fn file_line_stats_parses_diff_correctly() {
         let context = DiffContext {
-            status: "?? src/new.rs".to_string(),
+            diff: "\
+diff --git a/src/main.rs b/src/main.rs
+index 123456..789012 100644
+--- a/src/main.rs
++++ b/src/main.rs
+@@ -1,3 +1,4 @@
++added line 1
++added line 2
+-removed line 1
+ unmodified line
+--- /dev/null
++++ b/src/new_file.rs
+@@ -0,0 +1 @@
++untracked added line
+".to_string(),
             ..Default::default()
         };
 
-        assert!(
-            context
-                .summary("English")
-                .contains("- untracked: src/new.rs")
-        );
+        let stats = context.file_line_stats();
+        assert_eq!(stats.get("src/main.rs"), Some(&(2, 1)));
+        assert_eq!(stats.get("src/new_file.rs"), Some(&(1, 0)));
     }
 }

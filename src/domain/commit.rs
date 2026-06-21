@@ -501,21 +501,143 @@ pub fn review_prompt(language: &str, context: &DiffContext) -> String {
     )
 }
 
-pub fn status_prompt(language: &str, context: &DiffContext) -> String {
+pub fn diff_explanation_prompt(
+    language: &str,
+    context: &DiffContext,
+    current_branch: &str,
+    target_branch: &str,
+) -> String {
+    let target_desc = match language.to_lowercase().trim() {
+        "spanish" | "español" | "espanol" => format!(
+            "entre la rama actual '{}' y la rama seleccionada '{}'",
+            current_branch, target_branch
+        ),
+        _ => format!(
+            "between the current branch '{}' and the selected branch '{}'",
+            current_branch, target_branch
+        ),
+    };
+
+    let stats = context.file_line_stats();
+    let stats_section = if stats.is_empty() {
+        String::new()
+    } else {
+        let mut sec = match language.to_lowercase().trim() {
+            "spanish" | "español" | "espanol" => "\nESTADÍSTICAS DE LÍNEAS POR ARCHIVO (Úsalas obligatoriamente al listar los archivos):\n".to_string(),
+            _ => "\nFILE LINE STATS (You must use these when listing files):\n".to_string(),
+        };
+        for (file, (add, del)) in &stats {
+            sec.push_str(&format!("- {}: (+{}, -{})\n", file, add, del));
+        }
+        sec
+    };
+
+    let instructions = match language.to_lowercase().trim() {
+        "spanish" | "español" | "espanol" => {
+            format!(
+                "Analiza la comparación provista. La rama actual es '{}' y la rama seleccionada es '{}'.\n\
+                 El diff provisto muestra la diferencia para ir de '{}' (base) a '{}' (rama actual).\n\
+                 REGLAS IMPORTANTES:\n\
+                 - NO expliques qué hacen los cambios de código, no resumas la funcionalidad, no sugieras sintaxis de comandos ni describas qué cambios específicos hay entre las ramas.\n\
+                 - Explica/lista cuáles son los archivos diferentes entre una rama y otra (usando los datos de STATUS, STAT y ESTADÍSTICAS provistos), indicando obligatoriamente para cada archivo:\n\
+                   1. Su estado: si fue creado (A), modificado (M) o eliminado (D).\n\
+                   2. El número exacto de líneas agregadas y quitadas en el formato exacto (+A, -D).\n\
+                   Ejemplo: `• src/main.rs (M) (+12, -4)`\n\
+                 - Indica de forma concisa qué tan posible/seguro es realizar una fusión (merge) directa entre ambas ramas.\n\
+                 - NO utilices las palabras 'IA', 'AI', 'Inteligencia Artificial' o 'Artificial Intelligence' en tu respuesta bajo ninguna circunstancia.\n\
+                 - Sé extremadamente conciso, directo y pragmático. No uses emojis.",
+                current_branch, target_branch, target_branch, current_branch
+            )
+        }
+        _ => {
+            format!(
+                "Analyze the provided comparison. The current branch is '{}' and the selected branch is '{}'.\n\
+                 The provided diff shows the difference to go from '{}' (base) to '{}' (current branch).\n\
+                 IMPORTANT RULES:\n\
+                 - DO NOT explain what the code changes do, do not summarize the functionality, do not suggest command syntaxes, and do not describe what specific changes there are between the branches.\n\
+                 - Explain/list which files are different between one branch and the other (using the provided STATUS, STAT, and FILE LINE STATS data), strictly indicating for each file:\n\
+                   1. Its status: whether it was created (A), modified (M), or deleted (D).\n\
+                   2. The exact number of lines added and removed in the exact format (+A, -D).\n\
+                   Example: `• src/main.rs (M) (+12, -4)`\n\
+                 - Concisely indicate how possible/safe it is to perform a direct merge between both branches.\n\
+                 - DO NOT use the words 'IA', 'AI', 'Inteligencia Artificial', or 'Artificial Intelligence' in your response under any circumstances.\n\
+                 - Be extremely concise, direct, and pragmatic. Do not use emojis.",
+                current_branch, target_branch, target_branch, current_branch
+            )
+        }
+    };
+
     format!(
-        "Summarize the current Git working tree in {} for a CLI user. Do not use emojis. Be direct and practical.\n\n\
-         Required format:\n\
-         - Start with one short sentence saying whether there are changes to handle.\n\
-         - Then list each changed file as `file path: lines/range - what changed`.\n\
-         - Use line numbers or hunk ranges from the diff when available, for example `@@ -10,2 +10,5 @@`; if exact lines are not available, say `lines unknown`.\n\
-         - Mention untracked, staged, unstaged, deleted, or renamed state when visible from STATUS.\n\
-         - Do not include commit suggestions unless the user asks.\n\n\
-         STATUS:\n{}\n\nSTAT:\n{}\n\nDIFF:\n{}{}{}",
+        "Explain the differences {} in {}.\n\n{}\n\nSTATUS:\n{}\n\nSTAT:\n{}{}\n\nDIFF:\n{}{}{}",
+        target_desc,
         language,
+        instructions,
         context.status,
         context.stat,
+        stats_section,
         context.diff,
         context.truncation_warning(language),
+        language_reinforcement(language)
+    )
+}
+
+pub fn status_prompt(language: &str, context: &DiffContext) -> String {
+    let stats = context.file_line_stats();
+    let stats_section = if stats.is_empty() {
+        String::new()
+    } else {
+        let mut sec = match language.to_lowercase().trim() {
+            "spanish" | "español" | "espanol" => "\nESTADÍSTICAS DE LÍNEAS POR ARCHIVO (Úsalas exactamente en el formato (+A, -D) para cada archivo):\n".to_string(),
+            _ => "\nFILE LINE STATS (Use these exactly in the (+A, -D) format for each file):\n".to_string(),
+        };
+        for (file, (add, del)) in &stats {
+            sec.push_str(&format!("- {}: (+{}, -{})\n", file, add, del));
+        }
+        sec
+    };
+
+    let format_instruction = match language.to_lowercase().trim() {
+        "spanish" | "español" | "espanol" => {
+            "Required format:\n\
+             - Comienza con una frase corta indicando si hay cambios en el directorio de trabajo.\n\
+             - Luego, lista cada archivo modificado con el formato: `• ruta/del/archivo: rango (+A, -D)` (donde rango es el diff range tipo `@@ -X,Y +W,Z @@` si está disponible, y `A` y `D` son la cantidad exacta de adiciones y eliminaciones de líneas provistas para ese archivo abajo. Si no hay adiciones o eliminaciones, escribe 0).\n\
+             - Debajo de cada archivo, detalla exactamente los cambios usando sangría de 2 espacios y los prefijos correspondientes:\n\
+               * Usa `  + ` para describir las adiciones o nuevas líneas de código (líneas agregadas).\n\
+               * Usa `  - ` para describir las eliminaciones, código removido o reemplazado (líneas quitadas).\n\
+             - Ejemplo:\n\
+               • src/main.rs: @@ -10,2 +10,5 @@ (+27, -1)\n\
+                 + se agregó la inicialización del logger\n\
+                 - se eliminó el import no utilizado\n\
+             - IMPORTANTE: No uses viñetas como `*` o `-` para las descripciones de los cambios; usa estrictamente `  + ` para adiciones y `  - ` para eliminaciones.\n\
+             - Cada línea de cambio debe estar en una línea nueva debajo del archivo correspondiente, nunca en la misma línea del archivo."
+        }
+        _ => {
+            "Required format:\n\
+             - Start with one short sentence stating whether there are changes in the working directory.\n\
+             - Then, list each modified file as: `• file/path: range (+A, -D)` (where range is the diff range like `@@ -X,Y +W,Z @@` if available, and `A` and `D` are the exact addition and deletion counts of lines provided for that file below. If there are no additions or deletions, use 0).\n\
+             - Under each file, list the details of the changes using 2 spaces of indentation and the corresponding prefix:\n\
+               * Use `  + ` for describing additions or new code lines (added lines).\n\
+               * Use `  - ` for describing deletions, removed, or replaced code (removed lines).\n\
+             - Example:\n\
+               • src/main.rs: @@ -10,2 +10,5 @@ (+27, -1)\n\
+                 + added logger initialization\n\
+                 - removed unused import\n\
+             - IMPORTANT: Do not use bullet points like `*` or `-` for change descriptions; use strictly `  + ` for additions and `  - ` for deletions.\n\
+             - Each change line must be on a new line under the corresponding file, never on the same line as the file."
+        }
+    };
+
+    format!(
+        "Summarize the current Git working tree in {} for a CLI user. Do not use emojis. Be direct and practical.\n\n\
+         {}\n\n\
+         STATUS:\n{}\n\nSTAT:\n{}\n{}{}\n\nDIFF:\n{}{}",
+        language,
+        format_instruction,
+        context.status,
+        context.stat,
+        stats_section,
+        context.truncation_warning(language),
+        context.diff,
         language_reinforcement(language)
     )
 }
@@ -701,10 +823,11 @@ mod tests {
             truncated: false,
         };
 
-        let prompt = status_prompt("Spanish", &context);
+        let prompt = status_prompt("English", &context);
 
-        assert!(prompt.contains("file path: lines/range - what changed"));
-        assert!(prompt.contains("lines unknown"));
+        assert!(prompt.contains("file/path: range (+A, -D)"));
+        assert!(prompt.contains("`@@ -X,Y +W,Z @@`"));
+        assert!(prompt.contains("use 0"));
         assert!(prompt.contains("STATUS:"));
         assert!(prompt.contains("@@ -10,2 +10,4 @@"));
         assert!(prompt.contains("CRITICAL"));
