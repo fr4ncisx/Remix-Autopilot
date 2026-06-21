@@ -27,8 +27,8 @@ use crate::domain::{
 };
 use crate::error::{AppError, Result};
 use crate::infrastructure::{
-    DependencyAction, DependencyActionKind, DependencyDoctor, DependencyKind, DependencyState,
-    DependencyStatus, PlatformInfo, SwitchBranches,
+    CommitLogEntry, DependencyAction, DependencyActionKind, DependencyDoctor, DependencyKind,
+    DependencyState, DependencyStatus, PlatformInfo, SwitchBranches,
 };
 
 use super::render::draw;
@@ -58,6 +58,8 @@ pub enum AsyncOutcome {
         succeeded: bool,
     },
     CommitPlanReady(CommitPlan, LlmContextUsage),
+    CommitLogReady(Vec<CommitLogEntry>),
+    CommitLogReset(String),
     SwitchBranchesReady(SwitchBranches),
     PrDraft(String, PullRequestDraft),
     ModelPicker(Vec<String>),
@@ -740,25 +742,25 @@ impl TuiApp {
             }
             Intent::Lang(None) => self.open_language_picker(),
             Intent::Switch => self.start_switch_branch_flow(tx),
-            Intent::Explain | Intent::Review => {
+            Intent::Log => self.start_commit_log_flow(tx),
+            Intent::Explain | Intent::Review | Intent::Status => {
                 self.busy = true;
                 self.busy_message = intent_busy_message(&intent, &lang);
                 self.push_streaming_assistant(translate("Working on it...", &lang));
                 let mut core = self.core.clone();
-                let is_explain = intent == Intent::Explain;
+                let streaming_intent = intent.clone();
                 let tx_clone = tx.clone();
                 let handle = tokio::spawn(async move {
                     let stream_ctx = StreamingContext::new(&tx_clone);
-                    let outcome = if is_explain {
-                        match core.explain_stream(stream_ctx.tx_token).await {
-                            Ok(_) => AsyncOutcome::StreamEnd,
-                            Err(e) => AsyncOutcome::Error(e),
-                        }
-                    } else {
-                        match core.review_stream(stream_ctx.tx_token).await {
-                            Ok(_) => AsyncOutcome::StreamEnd,
-                            Err(e) => AsyncOutcome::Error(e),
-                        }
+                    let result = match streaming_intent {
+                        Intent::Explain => core.explain_stream(stream_ctx.tx_token).await,
+                        Intent::Review => core.review_stream(stream_ctx.tx_token).await,
+                        Intent::Status => core.status_summary_stream(stream_ctx.tx_token).await,
+                        _ => unreachable!("non-streaming intent routed to streaming handler"),
+                    };
+                    let outcome = match result {
+                        Ok(_) => AsyncOutcome::StreamEnd,
+                        Err(e) => AsyncOutcome::Error(e),
                     };
                     let _ = tx_clone
                         .send(AppEvent::AsyncOutcome(Box::new(outcome)))
@@ -893,6 +895,14 @@ impl TuiApp {
         self.spawn_outcome_task(tx, switch_branches_outcome(core));
     }
 
+    fn start_commit_log_flow(&mut self, tx: mpsc::Sender<AppEvent>) {
+        let lang = self.core.config.language.clone();
+        self.busy = true;
+        self.busy_message = intent_busy_message(&Intent::Log, &lang);
+        let core = self.core.clone();
+        self.spawn_outcome_task(tx, commit_log_outcome(core));
+    }
+
     pub fn apply_outcome(&mut self, outcome: AsyncOutcome) {
         let lang = self.core.config.language.clone();
         match outcome {
@@ -1000,6 +1010,29 @@ impl TuiApp {
                     scroll: 0,
                 });
             }
+            AsyncOutcome::CommitLogReady(entries) => {
+                if entries.is_empty() {
+                    self.push_system(translate("No commits found.", &lang));
+                } else {
+                    self.modal = Some(Modal::CommitLog {
+                        entries,
+                        selected: 0,
+                        action: 0,
+                        scroll: 0,
+                    });
+                }
+            }
+            AsyncOutcome::CommitLogReset(output) => {
+                let mut message = translate(
+                    "Soft reset completed. Changes were kept for recommit.",
+                    &lang,
+                );
+                if !output.trim().is_empty() {
+                    message.push_str("\n\n");
+                    message.push_str(output.trim());
+                }
+                self.push_system(message);
+            }
             AsyncOutcome::PrDraft(base, draft) => {
                 self.pending_modal = None;
                 self.scout_pending = false;
@@ -1011,11 +1044,11 @@ impl TuiApp {
                 });
             }
             AsyncOutcome::PushCompleted(output) => {
-                self.push_assistant(if output.is_empty() {
-                    "Push completed.".to_string()
-                } else {
-                    output
-                });
+                self.push_system(push_completed_message(
+                    self.core.status().branch.as_str(),
+                    output.as_str(),
+                    &lang,
+                ));
             }
             AsyncOutcome::CommitCreated(message) => {
                 self.push_assistant(format!("Commit created:\n{}", message.title()));
@@ -1154,6 +1187,21 @@ impl TuiApp {
                 } else if let Some(Modal::CommitPlanReview { selected, .. }) = self.modal.as_mut() {
                     let max = 2;
                     *selected = if *selected == 0 { max } else { *selected - 1 };
+                } else if let Some(Modal::CommitLog {
+                    entries,
+                    selected,
+                    scroll,
+                    ..
+                }) = self.modal.as_mut()
+                {
+                    if !entries.is_empty() {
+                        *selected = if *selected == 0 {
+                            entries.len().saturating_sub(1)
+                        } else {
+                            selected.saturating_sub(1)
+                        };
+                        *scroll = (*selected).saturating_sub(8);
+                    }
                 } else if let Some(Modal::ProtectedBranchCommit {
                     selected,
                     editing_new_branch,
@@ -1171,6 +1219,17 @@ impl TuiApp {
                     *scroll = scroll.saturating_add(1);
                 } else if let Some(Modal::CommitPlanReview { selected, .. }) = self.modal.as_mut() {
                     *selected = (*selected + 1) % 3;
+                } else if let Some(Modal::CommitLog {
+                    entries,
+                    selected,
+                    scroll,
+                    ..
+                }) = self.modal.as_mut()
+                {
+                    if !entries.is_empty() {
+                        *selected = (*selected + 1) % entries.len();
+                        *scroll = (*selected).saturating_sub(8);
+                    }
                 } else if let Some(Modal::ProtectedBranchCommit {
                     selected,
                     editing_new_branch,
@@ -1199,6 +1258,8 @@ impl TuiApp {
                 } else if let Some(Modal::CommitPlanReview { selected, .. }) = self.modal.as_mut() {
                     let max = 2;
                     *selected = if *selected == 0 { max } else { *selected - 1 };
+                } else if let Some(Modal::CommitLog { action, .. }) = self.modal.as_mut() {
+                    *action = if *action == 0 { 1 } else { 0 };
                 } else if let Some(Modal::CommitReview { selected, .. }) = self.modal.as_mut() {
                     let max = 3;
                     *selected = if *selected == 0 { max } else { *selected - 1 };
@@ -1224,6 +1285,8 @@ impl TuiApp {
                 } else if let Some(Modal::CommitPlanReview { selected, .. }) = self.modal.as_mut() {
                     let max = 2;
                     *selected = if *selected == max { 0 } else { *selected + 1 };
+                } else if let Some(Modal::CommitLog { action, .. }) = self.modal.as_mut() {
+                    *action = (*action + 1) % 2;
                 } else if let Some(Modal::CommitReview { selected, .. }) = self.modal.as_mut() {
                     let max = 3;
                     *selected = if *selected == max { 0 } else { *selected + 1 };
@@ -1271,6 +1334,12 @@ impl TuiApp {
                     *scroll = scroll.saturating_sub(5);
                 } else if let Some(Modal::PrDraft { scroll, .. }) = self.modal.as_mut() {
                     *scroll = scroll.saturating_sub(5);
+                } else if let Some(Modal::CommitLog {
+                    selected, scroll, ..
+                }) = self.modal.as_mut()
+                {
+                    *selected = selected.saturating_sub(5);
+                    *scroll = (*selected).saturating_sub(8);
                 }
             }
             KeyCode::PageDown => {
@@ -1280,6 +1349,16 @@ impl TuiApp {
                     *scroll = scroll.saturating_add(5);
                 } else if let Some(Modal::PrDraft { scroll, .. }) = self.modal.as_mut() {
                     *scroll = scroll.saturating_add(5);
+                } else if let Some(Modal::CommitLog {
+                    entries,
+                    selected,
+                    scroll,
+                    ..
+                }) = self.modal.as_mut()
+                    && !entries.is_empty()
+                {
+                    *selected = (*selected + 5).min(entries.len().saturating_sub(1));
+                    *scroll = (*selected).saturating_sub(8);
                 }
             }
             KeyCode::Tab => {
@@ -1287,6 +1366,8 @@ impl TuiApp {
                     self.move_modal_selection(1);
                 } else if let Some(Modal::CommitPlanReview { selected, .. }) = self.modal.as_mut() {
                     *selected = (*selected + 1) % 3;
+                } else if let Some(Modal::CommitLog { action, .. }) = self.modal.as_mut() {
+                    *action = (*action + 1) % 2;
                 } else if let Some(Modal::ProtectedBranchCommit {
                     selected,
                     editing_new_branch,
@@ -1356,6 +1437,15 @@ impl TuiApp {
             }
             Modal::CommitPlanReview { plan, selected, .. } => {
                 self.activate_commit_plan(plan, selected, tx).await?
+            }
+            Modal::CommitLog {
+                entries,
+                selected,
+                action,
+                ..
+            } => {
+                self.activate_commit_log(entries, selected, action, tx)
+                    .await?
             }
             Modal::BranchSwitch { branches, selected } => {
                 self.activate_branch_switch(branches, selected, tx).await?
@@ -1614,6 +1704,37 @@ impl TuiApp {
             self.push_assistant(translate("Cancelled.", &lang));
         }
 
+        Ok(())
+    }
+
+    async fn activate_commit_log(
+        &mut self,
+        entries: Vec<CommitLogEntry>,
+        selected: usize,
+        action: usize,
+        tx: mpsc::Sender<AppEvent>,
+    ) -> Result<()> {
+        let lang = self.core.config.language.clone();
+        if action != 0 {
+            self.push_assistant(translate("Cancelled.", &lang));
+            return Ok(());
+        }
+
+        let Some(entry) = entries.get(selected).cloned() else {
+            self.push_error(AppError::Custom(
+                "Selected commit is unavailable.".to_string(),
+            ));
+            return Ok(());
+        };
+
+        self.busy = true;
+        self.busy_message = translate("Rewriting history safely...", &lang);
+        self.push_system(format!(
+            "Soft reset to `{}` selected. No files will be deleted; changes stay staged for recommit.",
+            entry.short_hash
+        ));
+        let core = self.core.clone();
+        self.spawn_outcome_task(tx, commit_log_reset_outcome(core, entry.hash));
         Ok(())
     }
 
@@ -2070,6 +2191,9 @@ impl TuiApp {
             Modal::Confirm { selected, .. } => (selected, 2),
             Modal::CommitReview { selected, .. } => (selected, 4),
             Modal::CommitPlanReview { selected, .. } => (selected, 3),
+            Modal::CommitLog {
+                selected, entries, ..
+            } => (selected, entries.len()),
             Modal::BranchSwitch {
                 selected, branches, ..
             } => (selected, branches.total_count()),
@@ -2920,6 +3044,8 @@ fn outcome_completes_busy(outcome: &AsyncOutcome) -> bool {
             | AsyncOutcome::Message(_)
             | AsyncOutcome::Error(_)
             | AsyncOutcome::CommitPlanReady(_, _)
+            | AsyncOutcome::CommitLogReady(_)
+            | AsyncOutcome::CommitLogReset(_)
             | AsyncOutcome::SwitchBranchesReady(_)
             | AsyncOutcome::PrDraft(_, _)
             | AsyncOutcome::ModelPicker(_)
@@ -2929,6 +3055,28 @@ fn outcome_completes_busy(outcome: &AsyncOutcome) -> bool {
             | AsyncOutcome::DependencyCommandFinished { .. }
             | AsyncOutcome::RemoteBranches(_)
     )
+}
+
+async fn commit_log_outcome(core: AppCore) -> AsyncOutcome {
+    match tokio::task::spawn_blocking(move || core.commit_log()).await {
+        Ok(Ok(entries)) => AsyncOutcome::CommitLogReady(entries),
+        Ok(Err(error)) => AsyncOutcome::Error(error),
+        Err(error) => AsyncOutcome::Error(AppError::Custom(format!(
+            "Background task failed: {}",
+            error
+        ))),
+    }
+}
+
+async fn commit_log_reset_outcome(core: AppCore, hash: String) -> AsyncOutcome {
+    match tokio::task::spawn_blocking(move || core.reset_soft_to_commit(&hash)).await {
+        Ok(Ok(output)) => AsyncOutcome::CommitLogReset(output),
+        Ok(Err(error)) => AsyncOutcome::Error(error),
+        Err(error) => AsyncOutcome::Error(AppError::Custom(format!(
+            "Background task failed: {}",
+            error
+        ))),
+    }
 }
 
 async fn draft_commit_plan_outcome(mut core: AppCore) -> AsyncOutcome {
@@ -2966,6 +3114,37 @@ fn display_error_message(error: &AppError) -> String {
     }
 }
 
+fn push_completed_message(branch: &str, output: &str, language: &str) -> String {
+    let is_spanish = matches!(
+        language.to_lowercase().trim(),
+        "spanish" | "español" | "espanol"
+    );
+    let branch = branch.trim();
+    let mut message = if branch.is_empty() || branch == "-" {
+        if is_spanish {
+            "Push completado.".to_string()
+        } else {
+            "Push completed.".to_string()
+        }
+    } else if is_spanish {
+        format!("Push completado para la rama `{branch}`.")
+    } else {
+        format!("Push completed for branch `{branch}`.")
+    };
+
+    let output = output.trim();
+    if !output.is_empty() {
+        if is_spanish {
+            message.push_str("\n\nSalida de Git:\n");
+        } else {
+            message.push_str("\n\nGit output:\n");
+        }
+        message.push_str(output);
+    }
+
+    message
+}
+
 pub fn translate(text: &str, language: &str) -> String {
     let lang = language.to_lowercase();
     let lang_str = lang.trim();
@@ -2988,6 +3167,8 @@ pub fn translate(text: &str, language: &str) -> String {
             "Select provider" => "Seleccionar proveedor",
             "Switch branch" => "Cambiar de rama",
             "Fetching branches..." => "Obteniendo ramas...",
+            "Loading commit history..." => "Cargando historial de commits...",
+            "Rewriting history safely..." => "Reescribiendo historial de forma segura...",
             "Switching branch..." => "Cambiando de rama...",
             "Protected branch" => "Rama protegida",
             "Choose intended action" => "Selecciona la acción deseada",
@@ -3023,6 +3204,10 @@ pub fn translate(text: &str, language: &str) -> String {
             "Enter commit subject" => "Ingresa el asunto (subject) del commit",
             "Enter commit body" => "Ingresa la descripción larga (body) del commit",
             "Commit plan executed." => "Plan de commits ejecutado.",
+            "No commits found." => "No se encontraron commits.",
+            "Soft reset completed. Changes were kept for recommit." => {
+                "Reset soft completado. Los cambios quedaron disponibles para volver a commitear."
+            }
             "Retry" => "Reintentar",
             "Close" => "Cerrar",
             "Exit CLI" => "Salir del CLI",
@@ -3162,6 +3347,12 @@ pub enum Modal {
         selected: usize,
         scroll: usize,
     },
+    CommitLog {
+        entries: Vec<CommitLogEntry>,
+        selected: usize,
+        action: usize,
+        scroll: usize,
+    },
     BranchSwitch {
         branches: SwitchBranches,
         selected: usize,
@@ -3269,8 +3460,10 @@ fn intent_busy_message(intent: &Intent, language: &str) -> String {
         "spanish" | "español" | "espanol" => match intent {
             Intent::Commit => "Generando un plan de commits estructurado...".to_string(),
             Intent::Switch => "Obteniendo ramas...".to_string(),
+            Intent::Log => "Cargando historial de commits...".to_string(),
             Intent::Explain => "Explicando cambios...".to_string(),
             Intent::Review => "Revisando cambios...".to_string(),
+            Intent::Status => "Analizando estado de cambios...".to_string(),
             Intent::DeprecatedDryRun => "Mostrando aviso de comando eliminado...".to_string(),
             Intent::Push => "Haciendo push de la rama...".to_string(),
             Intent::Pr => "Obteniendo ramas remotas...".to_string(),
@@ -3283,8 +3476,10 @@ fn intent_busy_message(intent: &Intent, language: &str) -> String {
         _ => match intent {
             Intent::Commit => "Generating a structured commit plan...".to_string(),
             Intent::Switch => "Fetching branches...".to_string(),
+            Intent::Log => "Loading commit history...".to_string(),
             Intent::Explain => "Explaining changes...".to_string(),
             Intent::Review => "Reviewing changes...".to_string(),
+            Intent::Status => "Analyzing change status...".to_string(),
             Intent::DeprecatedDryRun => "Showing removed command notice...".to_string(),
             Intent::Push => "Pushing branch...".to_string(),
             Intent::Pr => "Fetching remote branches...".to_string(),
@@ -3335,14 +3530,24 @@ fn onboarding_action_count(step: &OnboardingStep) -> usize {
 fn intent_requires_ai_provider(intent: &Intent) -> bool {
     matches!(
         intent,
-        Intent::Commit | Intent::Explain | Intent::Review | Intent::Pr | Intent::Model
+        Intent::Commit
+            | Intent::Explain
+            | Intent::Review
+            | Intent::Status
+            | Intent::Pr
+            | Intent::Model
     )
 }
 
 fn intent_requires_ollama(intent: &Intent) -> bool {
     matches!(
         intent,
-        Intent::Commit | Intent::Explain | Intent::Review | Intent::Pr | Intent::Model
+        Intent::Commit
+            | Intent::Explain
+            | Intent::Review
+            | Intent::Status
+            | Intent::Pr
+            | Intent::Model
     )
 }
 
@@ -4761,6 +4966,55 @@ mod tests {
         assert!(app.history.iter().any(|entry| {
             entry.role == ChatRole::Assistant
                 && entry.message.contains("Already on branch `feature/api`.")
+        }));
+    }
+
+    #[test]
+    fn push_completed_message_explicitly_names_branch_and_git_output() {
+        let message = push_completed_message(
+            "feature/ui",
+            "To github.com:owner/repo.git\n   abc..def  feature/ui -> feature/ui",
+            "English",
+        );
+
+        assert!(
+            message.contains("Push completed for branch `feature/ui`."),
+            "{message}"
+        );
+        assert!(message.contains("Git output:"), "{message}");
+        assert!(message.contains("feature/ui -> feature/ui"), "{message}");
+    }
+
+    #[test]
+    fn push_completed_message_is_localized_in_spanish() {
+        let message = push_completed_message("main", "", "Spanish");
+
+        assert_eq!(message, "Push completado para la rama `main`.");
+    }
+
+    #[tokio::test]
+    async fn push_completed_outcome_adds_explicit_system_message() {
+        let dir = tempdir().unwrap();
+        git_in(dir.path(), &["init", "-b", "feature/ui"]);
+        let mut app = make_app_in(dir.path().to_path_buf());
+        let (tx, _rx) = mpsc::channel(4);
+
+        app.process_event(
+            AppEvent::AsyncOutcome(Box::new(AsyncOutcome::PushCompleted(
+                "Everything up-to-date".to_string(),
+            ))),
+            &tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(app.history.iter().any(|entry| {
+            entry.role == ChatRole::System
+                && entry
+                    .message
+                    .contains("Push completed for branch `feature/ui`.")
+                && entry.message.contains("Git output:")
+                && entry.message.contains("Everything up-to-date")
         }));
     }
 

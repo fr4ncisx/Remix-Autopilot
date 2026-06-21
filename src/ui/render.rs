@@ -1635,6 +1635,92 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
                 &mut state,
             );
         }
+        Modal::CommitLog {
+            entries,
+            selected,
+            action,
+            scroll,
+        } => {
+            let is_spanish = matches!(lang.trim(), "spanish" | "español" | "espanol");
+            let title = if is_spanish {
+                "Historial Git"
+            } else {
+                "Git history"
+            };
+            let hint = if is_spanish {
+                "↑↓ commit  Tab acción  Enter confirmar  Esc cerrar"
+            } else {
+                "↑↓ commit  Tab action  Enter confirm  Esc close"
+            };
+            let block_title = format!("{title} | {hint}");
+            let block = modal_block(&block_title, colors);
+            frame.render_widget(block.clone(), area);
+            let inner = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(8), Constraint::Length(3)])
+                .split(block.inner(area));
+            let visible = inner[0].height.saturating_sub(1).max(1) as usize;
+            let start = (*scroll).min(entries.len().saturating_sub(1));
+            let rows = entries
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(visible)
+                .map(|(index, entry)| {
+                    let is_selected = index == *selected;
+                    let marker = if is_selected { ">" } else { " " };
+                    let decorations = if entry.decorations.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", entry.decorations)
+                    };
+                    let style = if is_selected {
+                        Style::default().fg(colors.text).bg(colors.info).bold()
+                    } else {
+                        Style::default().fg(colors.text).bg(colors.modal_bg)
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(marker, style),
+                        Span::raw(" "),
+                        Span::styled(entry.short_hash.clone(), style.fg(colors.accent)),
+                        Span::styled(decorations, style.fg(colors.warning)),
+                        Span::raw(" "),
+                        Span::styled(entry.subject.clone(), style),
+                        Span::styled(
+                            format!("  {} · {}", entry.author, entry.relative_time),
+                            style.fg(colors.muted),
+                        ),
+                    ]))
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(
+                List::new(rows).style(Style::default().bg(colors.modal_bg)),
+                inner[0],
+            );
+            let actions = if is_spanish {
+                ["Reset soft hasta este commit", "Cerrar"]
+            } else {
+                ["Soft reset to this commit", "Close"]
+            };
+            let action_line = actions
+                .iter()
+                .enumerate()
+                .flat_map(|(index, label)| {
+                    let style = if index == *action {
+                        Style::default().fg(colors.text).bg(colors.info).bold()
+                    } else {
+                        Style::default().fg(colors.muted).bg(colors.modal_bg)
+                    };
+                    [Span::styled(format!(" {} ", label), style), Span::raw("  ")]
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(
+                Paragraph::new(Line::from(action_line))
+                    .style(Style::default().bg(colors.modal_bg))
+                    .wrap(Wrap { trim: true }),
+                inner[1],
+            );
+        }
         Modal::ProtectedBranchCommit {
             branch,
             branches,
