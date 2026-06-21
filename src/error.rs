@@ -292,7 +292,10 @@ mod tests {
 
     #[test]
     fn display_json_serialize_shows_error() {
-        let error = AppError::JsonSerialize(serde_json::to_string(&f64::NAN).unwrap_err());
+        let mut map = std::collections::HashMap::new();
+        map.insert(vec![1, 2], 3);
+        let json_err = serde_json::to_string(&map).unwrap_err();
+        let error = AppError::JsonSerialize(json_err);
         assert!(error.to_string().contains("failed to serialize JSON"));
     }
 }

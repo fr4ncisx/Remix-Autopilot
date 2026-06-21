@@ -34,8 +34,18 @@ impl ConfigRepository {
     }
 
     pub fn path() -> Result<PathBuf> {
-        let base = dirs::config_dir().ok_or(AppError::ConfigDir)?;
-        Ok(base.join("remix-autopilot").join("config.json"))
+        #[cfg(test)]
+        {
+            let pid = std::process::id();
+            let thread_id = format!("{:?}", std::thread::current().id());
+            let thread_clean: String = thread_id.chars().filter(|c| c.is_alphanumeric()).collect();
+            Ok(std::env::temp_dir().join(format!("remix-autopilot-test-{}-{}.json", pid, thread_clean)))
+        }
+        #[cfg(not(test))]
+        {
+            let base = dirs::config_dir().ok_or(AppError::ConfigDir)?;
+            Ok(base.join("remix-autopilot").join("config.json"))
+        }
     }
 }
 
@@ -86,6 +96,7 @@ mod tests {
     fn save_creates_parent_directories() {
         let dir = tempdir().unwrap();
         let path = dir
+            .path()
             .join("deeply")
             .join("nested")
             .join("remix-autopilot")
