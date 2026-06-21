@@ -16,6 +16,14 @@ pub struct RepoStatus {
     pub is_repo: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkingTreeSync {
+    pub has_changes: bool,
+    pub has_upstream: bool,
+    pub ahead: u32,
+    pub behind: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchSource {
     Local,
@@ -28,6 +36,16 @@ pub struct BranchOption {
     pub source: BranchSource,
     pub last_commit_unix: Option<i64>,
     pub is_current: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitLogEntry {
+    pub hash: String,
+    pub short_hash: String,
+    pub decorations: String,
+    pub subject: String,
+    pub author: String,
+    pub relative_time: String,
 }
 
 impl BranchOption {
@@ -121,6 +139,11 @@ impl Git {
         } else {
             Err(AppError::NotGitRepo)
         }
+    }
+
+    pub fn working_tree_sync(&self) -> Result<WorkingTreeSync> {
+        let output = self.output(["status", "--porcelain=v1", "--branch"])?;
+        Ok(parse_working_tree_sync(&output))
     }
 
     pub fn init(&self) -> Result<String> {
@@ -250,6 +273,23 @@ impl Git {
         } else {
             self.output_push(["push", "--set-upstream", "origin", &branch])
         }
+    }
+
+    pub fn commit_log(&self, limit: usize) -> Result<Vec<CommitLogEntry>> {
+        let limit = limit.clamp(1, 100).to_string();
+        let output = self.output([
+            "log",
+            "--date=relative",
+            "--decorate=short",
+            "--format=%H%x1f%h%x1f%D%x1f%s%x1f%an%x1f%cr",
+            "-n",
+            &limit,
+        ])?;
+        Ok(parse_commit_log(&output))
+    }
+
+    pub fn reset_soft_to(&self, hash: &str) -> Result<String> {
+        self.output(["reset", "--soft", hash])
     }
 
     pub fn fetch_origin(&self) -> Result<String> {
@@ -592,6 +632,58 @@ fn is_protected_branch_name(branch: &str) -> bool {
     matches!(branch.trim(), "main" | "master")
 }
 
+fn parse_working_tree_sync(output: &str) -> WorkingTreeSync {
+    let mut sync = WorkingTreeSync::default();
+    for line in output.lines() {
+        if let Some(branch) = line.strip_prefix("## ") {
+            sync.has_upstream = branch.contains("...");
+            if let Some(metadata) = branch
+                .split('[')
+                .nth(1)
+                .and_then(|part| part.split(']').next())
+            {
+                for item in metadata.split(',') {
+                    let item = item.trim();
+                    if let Some(value) = item.strip_prefix("ahead ") {
+                        sync.ahead = value.parse().unwrap_or(0);
+                    } else if let Some(value) = item.strip_prefix("behind ") {
+                        sync.behind = value.parse().unwrap_or(0);
+                    }
+                }
+            }
+        } else if !line.trim().is_empty() {
+            sync.has_changes = true;
+        }
+    }
+    sync
+}
+
+fn parse_commit_log(output: &str) -> Vec<CommitLogEntry> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\x1f');
+            let hash = parts.next()?.trim();
+            let short_hash = parts.next()?.trim();
+            let decorations = parts.next().unwrap_or("").trim();
+            let subject = parts.next().unwrap_or("").trim();
+            let author = parts.next().unwrap_or("").trim();
+            let relative_time = parts.next().unwrap_or("").trim();
+            if hash.is_empty() || short_hash.is_empty() {
+                return None;
+            }
+            Some(CommitLogEntry {
+                hash: hash.to_string(),
+                short_hash: short_hash.to_string(),
+                decorations: decorations.to_string(),
+                subject: subject.to_string(),
+                author: author.to_string(),
+                relative_time: relative_time.to_string(),
+            })
+        })
+        .collect()
+}
+
 fn classify_push_error(error: AppError) -> AppError {
     let AppError::GitCommand { args, stderr } = error else {
         return error;
@@ -693,6 +785,51 @@ mod tests {
 
     fn write_file(path: &Path, name: &str, body: &str) {
         std::fs::write(path.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn parses_clean_synced_branch_status() {
+        let sync = parse_working_tree_sync("## main...origin/main\n");
+
+        assert!(!sync.has_changes);
+        assert!(sync.has_upstream);
+        assert_eq!(sync.ahead, 0);
+        assert_eq!(sync.behind, 0);
+    }
+
+    #[test]
+    fn parses_ahead_behind_and_local_changes() {
+        let sync = parse_working_tree_sync(
+            "## feature/api...origin/feature/api [ahead 2, behind 1]\n M src/main.rs\n?? docs/new.md\n",
+        );
+
+        assert!(sync.has_changes);
+        assert!(sync.has_upstream);
+        assert_eq!(sync.ahead, 2);
+        assert_eq!(sync.behind, 1);
+    }
+
+    #[test]
+    fn parses_branch_without_upstream() {
+        let sync = parse_working_tree_sync("## local-only\n");
+
+        assert!(!sync.has_changes);
+        assert!(!sync.has_upstream);
+    }
+
+    #[test]
+    fn parses_decorated_commit_log_entries() {
+        let entries = parse_commit_log(
+            "abc123456789\x1fabc1234\x1fHEAD -> main, origin/main\x1fadd log modal\x1fAda\x1f2 minutes ago\n",
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hash, "abc123456789");
+        assert_eq!(entries[0].short_hash, "abc1234");
+        assert_eq!(entries[0].decorations, "HEAD -> main, origin/main");
+        assert_eq!(entries[0].subject, "add log modal");
+        assert_eq!(entries[0].author, "Ada");
+        assert_eq!(entries[0].relative_time, "2 minutes ago");
     }
 
     fn git_commit_with_dates(path: &Path, message: &str, author_date: &str, committer_date: &str) {
