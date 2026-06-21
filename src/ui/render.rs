@@ -1475,6 +1475,82 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
                 &mut state,
             );
         }
+        Modal::PrBaseBranch {
+            current_branch,
+            branches,
+            selected,
+        } => {
+            let is_spanish = is_spanish_language(&lang);
+            let title = if is_spanish {
+                "Seleccionar rama base del PR \u{2502} \u{2191}\u{2195} Enter selecc  Esc cerrar"
+            } else {
+                "Select PR base branch \u{2502} \u{2191}\u{2195} Enter select  Esc close"
+            };
+            let header = if is_spanish {
+                format!(
+                    "Creando PR desde \u{201c}{}\u{201d}\nSeleccion\u{00e1} la rama destino donde se mergear\u{00e1}n tus cambios.",
+                    current_branch
+                )
+            } else {
+                format!(
+                    "Creating PR from \u{201c}{}\u{201d}\nSelect the target branch where your changes will be merged.",
+                    current_branch
+                )
+            };
+            let rows: Vec<ListItem> = branches
+                .iter()
+                .enumerate()
+                .map(|(index, branch)| {
+                    let is_selected = index == *selected;
+                    let marker = if is_selected { ">" } else { " " };
+                    let style = if is_selected {
+                        Style::default().fg(colors.accent).bold()
+                    } else {
+                        Style::default().fg(colors.text)
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(marker, style),
+                        Span::raw(" "),
+                        Span::styled(branch.clone(), style),
+                    ]))
+                })
+                .collect();
+            let block = modal_block_with_border(title, colors, colors.accent);
+            frame.render_widget(block.clone(), area);
+            let inner = block.inner(area);
+            let padded = inner.inner(ratatui::layout::Margin {
+                horizontal: 2,
+                vertical: 1,
+            });
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                ])
+                .split(padded);
+            frame.render_widget(
+                Paragraph::new(header)
+                    .wrap(Wrap { trim: true })
+                    .style(Style::default().fg(colors.accent).bold()),
+                layout[0],
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "\u{2500}".repeat(layout[1].width as usize),
+                    Style::default().fg(colors.border),
+                )),
+                layout[1],
+            );
+            let mut state = ListState::default();
+            state.select(Some(*selected));
+            frame.render_stateful_widget(
+                List::new(rows).block(Block::default().borders(Borders::NONE)),
+                layout[2],
+                &mut state,
+            );
+        }
         Modal::Confirm {
             title,
             message,
@@ -2053,119 +2129,324 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
             selected,
             scroll,
         } => {
-            let text = format!("base: {}\n\ntitle: {}\n\n{}", base, draft.title, draft.body);
-            let actions = match lang.trim() {
-                "spanish" | "español" | "espanol" => ["Crear PR", "Cancelar"],
-                _ => ["Create PR", "Cancel"],
+            let is_spanish = matches!(lang.trim(), "spanish" | "español" | "espanol");
+            let pr_title = if is_spanish {
+                "Revisar Pull Request \u{2502} \u{2191}\u{2195} Enter  PgUp/PgDn scroll  Esc atr\u{00e1}s"
+            } else {
+                "Review Pull Request \u{2502} \u{2191}\u{2195} Enter  PgUp/PgDn scroll  Esc back"
             };
-            let inner_pr = Layout::default()
+            let actions = if is_spanish {
+                vec![
+                    OnboardingAction {
+                        label: "Crear PR".to_string(),
+                        help:
+                            "Crea el pull request en GitHub con el titulo y descripcion generados."
+                                .to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Cancelar".to_string(),
+                        help: "Descarta el PR y vuelve al chat.".to_string(),
+                    },
+                ]
+            } else {
+                vec![
+                    OnboardingAction {
+                        label: "Create PR".to_string(),
+                        help: "Creates the pull request on GitHub with the generated title and description.".to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Cancel".to_string(),
+                        help: "Discards the PR and returns to chat.".to_string(),
+                    },
+                ]
+            };
+            let header = if is_spanish {
+                format!(
+                    "Creando PR de \u{201c}{}\u{201d} \u{2192} \u{201c}{}\u{201d}\nRevisa el titulo y la descripcion generados por IA. Desplazate con PgUp/PgDn para ver el cuerpo completo.",
+                    draft.title.as_str().chars().take(40).collect::<String>(),
+                    base
+                )
+            } else {
+                format!(
+                    "Creating PR from \u{201c}{}\u{201d} \u{2192} \u{201c}{}\u{201d}\nReview the AI-generated title and description. Scroll with PgUp/PgDn to see the full body.",
+                    draft.title.as_str().chars().take(40).collect::<String>(),
+                    base
+                )
+            };
+            let title_label = if is_spanish { "T\u{00ed}tulo" } else { "Title" };
+            let base_label = if is_spanish { "Base" } else { "Base" };
+            let desc_label = if is_spanish {
+                "Descripci\u{00f3}n"
+            } else {
+                "Description"
+            };
+            let text = format!(
+                "{base_label}:  {base}\n\n{title_label}:\n{title}\n\n{desc_label}:\n{body}",
+                base_label = base_label,
+                base = base,
+                title_label = title_label,
+                title = draft.title,
+                desc_label = desc_label,
+                body = draft.body
+            );
+            let block = modal_block_with_border(pr_title, colors, colors.accent);
+            frame.render_widget(block.clone(), area);
+            let inner = block.inner(area);
+            let padded = inner.inner(ratatui::layout::Margin {
+                horizontal: 2,
+                vertical: 1,
+            });
+            let layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(4)])
-                .split(area);
-            let pr_title = match lang.trim() {
-                "spanish" | "español" | "espanol" => {
-                    "Pull Request \u{2502} \u{2191}\u{2195} Enter  PgUp/PgDn scroll  Esc atrás"
-                }
-                _ => "Pull Request \u{2502} \u{2191}\u{2195} Enter  PgUp/PgDn scroll  Esc back",
-            };
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(6),
+                ])
+                .split(padded);
             frame.render_widget(
-                Block::default()
-                    .title(pr_title)
-                    .title_alignment(ratatui::layout::Alignment::Center)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(colors.border))
-                    .style(Style::default().bg(colors.modal_bg)),
-                area,
+                Paragraph::new(header)
+                    .wrap(Wrap { trim: true })
+                    .style(Style::default().fg(colors.accent).bold()),
+                layout[0],
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "\u{2500}".repeat(layout[1].width as usize),
+                    Style::default().fg(colors.border),
+                )),
+                layout[1],
             );
             frame.render_widget(
                 Paragraph::new(text)
                     .scroll((*scroll as u16, 0))
-                    .wrap(Wrap { trim: true }),
-                inner_pr[0],
+                    .wrap(Wrap { trim: true })
+                    .style(Style::default().fg(colors.text)),
+                layout[2],
             );
-            frame.render_widget(plain_action_list(&actions, *selected, colors), inner_pr[1]);
-        }
-        Modal::ExistingPrs {
-            prs,
-            selected,
-            ..
-        } => {
-            let title = match lang.trim() {
-                "spanish" | "español" | "espanol" => "PR existente detectado",
-                _ => "Existing PR detected",
-            };
-            let actions = match lang.trim() {
-                "spanish" | "español" | "espanol" => ["Actualizar PR", "Cerrar y Recrear", "Cancelar"],
-                _ => ["Update PR", "Close and Recreate", "Cancel"],
-            };
-            let inner = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(5)])
-                .split(area);
-
             frame.render_widget(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(colors.border))
-                    .style(Style::default().bg(colors.modal_bg)),
-                area,
+                onboarding_action_list(&actions, *selected, colors),
+                layout[3],
             );
-
-            let pr_list: Vec<ListItem> = prs
+        }
+        Modal::ExistingPrs { prs, selected, .. } => {
+            let is_spanish = matches!(lang.trim(), "spanish" | "español" | "espanol");
+            let title = if is_spanish {
+                "PR existente detectado"
+            } else {
+                "Existing PR detected"
+            };
+            let actions = if is_spanish {
+                vec![
+                    OnboardingAction {
+                        label: "Actualizar PR".to_string(),
+                        help: "Envia los nuevos commits al PR existente.".to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Cerrar y Recrear".to_string(),
+                        help: "Cierra el PR actual y crea uno nuevo desde esta rama.".to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Cancelar".to_string(),
+                        help: "Vuelve al chat sin modificar ningun PR.".to_string(),
+                    },
+                ]
+            } else {
+                vec![
+                    OnboardingAction {
+                        label: "Update PR".to_string(),
+                        help: "Pushes new commits to the existing pull request.".to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Close and Recreate".to_string(),
+                        help: "Closes the current PR and creates a new one from this branch."
+                            .to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Cancel".to_string(),
+                        help: "Returns to chat without modifying any PR.".to_string(),
+                    },
+                ]
+            };
+            let header = if is_spanish {
+                "Ya existe un pull request desde esta rama hacia el destino seleccionado. Revisa los PRs existentes y eleg\u{00ed} c\u{00f3}mo proceder:"
+            } else {
+                "A pull request already exists from this branch to the selected target. Review the existing PRs and choose how to proceed:"
+            };
+            let pr_info: Vec<ListItem> = prs
                 .iter()
-                .enumerate()
-                .map(|(i, pr)| {
-                    let style = if i == *selected {
-                        Style::default().fg(colors.accent)
+                .map(|pr| {
+                    let author = pr
+                        .author
+                        .as_ref()
+                        .map(|a| a.login.as_str())
+                        .unwrap_or("unknown");
+                    let body_preview = pr
+                        .body
+                        .as_deref()
+                        .unwrap_or("")
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(80)
+                        .collect::<String>();
+                    let detail = if body_preview.is_empty() {
+                        if is_spanish {
+                            format!("#{} por @{}", pr.number, author)
+                        } else {
+                            format!("#{} by @{}", pr.number, author)
+                        }
+                    } else if is_spanish {
+                        format!("#{} por @{} \u{2014} {}", pr.number, author, body_preview)
                     } else {
-                        Style::default()
+                        format!("#{} by @{} \u{2014} {}", pr.number, author, body_preview)
                     };
-                    ListItem::new(format!("#{} - {}", pr.number, pr.title)).style(style)
+                    ListItem::new(Line::from(vec![
+                        Span::styled(pr.title.clone(), Style::default().fg(colors.text).bold()),
+                        Span::raw("\n"),
+                        Span::styled(detail, Style::default().fg(colors.muted)),
+                    ]))
                 })
                 .collect();
-
-            frame.render_widget(
-                List::new(pr_list).block(Block::default().borders(Borders::NONE)),
-                inner[0],
-            );
-            frame.render_widget(plain_action_list(&actions, *selected, colors), inner[1]);
-        }
-        Modal::ConflictResolution { selected, .. } => {
-            let title = match lang.trim() {
-                "spanish" | "español" | "espanol" => "Conflictos de fusión detectados",
-                _ => "Merge conflicts detected",
-            };
-            let msg = match lang.trim() {
-                "spanish" | "español" | "espanol" => {
-                    "Hay conflictos entre las ramas. ¿Cómo deseas resolverlos?"
-                }
-                _ => "There are conflicts between branches. How would you like to resolve them?",
-            };
-            let actions = match lang.trim() {
-                "spanish" | "español" | "espanol" => {
-                    ["Resolver con IA (Recomendado)", "Resolver manualmente", "Cancelar"]
-                }
-                _ => ["Resolve with AI (Recommended)", "Resolve manually", "Cancel"],
-            };
-            let inner = Layout::default()
+            let block = modal_block_with_border(title, colors, colors.accent);
+            frame.render_widget(block.clone(), area);
+            let inner = block.inner(area);
+            let padded = inner.inner(ratatui::layout::Margin {
+                horizontal: 2,
+                vertical: 1,
+            });
+            let layout = Layout::default()
                 .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(5)])
-                .split(area);
-
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(8),
+                ])
+                .split(padded);
             frame.render_widget(
-                Block::default()
-                    .title(title)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(colors.border))
-                    .style(Style::default().bg(colors.modal_bg)),
-                area,
+                Paragraph::new(header)
+                    .wrap(Wrap { trim: true })
+                    .style(Style::default().fg(colors.accent).bold()),
+                layout[0],
             );
             frame.render_widget(
-                Paragraph::new(msg).wrap(Wrap { trim: true }),
-                inner[0],
+                Paragraph::new(Span::styled(
+                    "\u{2500}".repeat(layout[1].width as usize),
+                    Style::default().fg(colors.border),
+                )),
+                layout[1],
             );
-            frame.render_widget(plain_action_list(&actions, *selected, colors), inner[1]);
+            frame.render_widget(
+                List::new(pr_info).block(Block::default().borders(Borders::NONE)),
+                layout[2],
+            );
+            frame.render_widget(
+                onboarding_action_list(&actions, *selected, colors),
+                layout[3],
+            );
+        }
+        Modal::ConflictResolution { selected, base } => {
+            let is_spanish = matches!(lang.trim(), "spanish" | "español" | "espanol");
+            let title = if is_spanish {
+                "Conflictos de fusion detectados"
+            } else {
+                "Merge conflicts detected"
+            };
+            let actions = if is_spanish {
+                vec![
+                    OnboardingAction {
+                        label: "Resolver con IA (Recomendado)".to_string(),
+                        help: "La IA analiza los conflictos y propone una solucion automatica."
+                            .to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Resolver manualmente".to_string(),
+                        help:
+                            "Abre los archivos con conflictos para que los resuelvas por tu cuenta."
+                                .to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Cancelar".to_string(),
+                        help: "Vuelve al chat sin resolver los conflictos.".to_string(),
+                    },
+                ]
+            } else {
+                vec![
+                    OnboardingAction {
+                        label: "Resolve with AI (Recommended)".to_string(),
+                        help: "AI analyzes the conflicts and proposes an automatic fix."
+                            .to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Resolve manually".to_string(),
+                        help: "Opens the conflicted files for you to resolve by hand.".to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Cancel".to_string(),
+                        help: "Returns to chat without resolving conflicts.".to_string(),
+                    },
+                ]
+            };
+            let header = if is_spanish {
+                format!(
+                    "No se puede fusionar automaticamente esta rama en \u{201c}{}\u{201d} porque hay conflictos. Elegi como resolverlos:",
+                    base
+                )
+            } else {
+                format!(
+                    "Cannot automatically merge this branch into \u{201c}{}\u{201d} due to conflicts. Choose how to resolve them:",
+                    base
+                )
+            };
+            let block = modal_block_with_border(title, colors, colors.warning);
+            frame.render_widget(block.clone(), area);
+            let inner = block.inner(area);
+            let padded = inner.inner(ratatui::layout::Margin {
+                horizontal: 2,
+                vertical: 1,
+            });
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(8),
+                ])
+                .split(padded);
+            frame.render_widget(
+                Paragraph::new(header)
+                    .wrap(Wrap { trim: true })
+                    .style(Style::default().fg(colors.warning).bold()),
+                layout[0],
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "\u{2500}".repeat(layout[1].width as usize),
+                    Style::default().fg(colors.border),
+                )),
+                layout[1],
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    if is_spanish {
+                        "Usa \u{2190}\u{2192} para cambiar opcion, Enter para confirmar, Esc para cancelar."
+                    } else {
+                        "Use \u{2190}\u{2192} to change option, Enter to confirm, Esc to cancel."
+                    },
+                    Style::default().fg(colors.muted),
+                ))
+                .wrap(Wrap { trim: true }),
+                layout[2],
+            );
+            frame.render_widget(
+                onboarding_action_list(&actions, *selected, colors),
+                layout[3],
+            );
         }
         Modal::Setup { selected } => {
             let is_spanish = matches!(lang.trim(), "spanish" | "español" | "espanol");
@@ -4503,5 +4784,197 @@ mod tests {
 
         assert_eq!(style.fg, Some(Color::Rgb(15, 23, 42)));
         assert_eq!(style.bg, Some(Color::Rgb(250, 204, 21)));
+    }
+
+    #[test]
+    fn pr_draft_modal_renders_title_and_actions() {
+        let mut app = make_app();
+        app.core.config.language = "English".to_string();
+        app.modal = Some(Modal::PrDraft {
+            base: "main".to_string(),
+            draft: crate::domain::commit::PullRequestDraft {
+                title: "feat: add dark mode".to_string(),
+                body: "- Added toggle\n- Updated theme".to_string(),
+            },
+            selected: 0,
+            scroll: 0,
+        });
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("Review Pull Request"), "{text}");
+        assert!(text.contains("Creating PR from"), "{text}");
+        assert!(text.contains("feat: add dark mode"), "{text}");
+        assert!(text.contains("Create PR"), "{text}");
+        assert!(text.contains("Cancel"), "{text}");
+        assert!(text.contains("main"), "{text}");
+    }
+
+    #[test]
+    fn pr_draft_modal_shows_description() {
+        let mut app = make_app();
+        app.modal = Some(Modal::PrDraft {
+            base: "develop".to_string(),
+            draft: crate::domain::commit::PullRequestDraft {
+                title: "fix: bug".to_string(),
+                body: "This fixes the critical bug.".to_string(),
+            },
+            selected: 0,
+            scroll: 0,
+        });
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("This fixes the critical bug."), "{text}");
+        assert!(text.contains("Description"), "{text}");
+    }
+
+    #[test]
+    fn pr_draft_modal_spanish_actions() {
+        let mut app = make_app();
+        app.core.config.language = "Spanish".to_string();
+        app.modal = Some(Modal::PrDraft {
+            base: "main".to_string(),
+            draft: crate::domain::commit::PullRequestDraft {
+                title: "feat: test".to_string(),
+                body: "Body".to_string(),
+            },
+            selected: 0,
+            scroll: 0,
+        });
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("Revisar Pull Request"), "{text}");
+        assert!(text.contains("Crear PR"), "{text}");
+        assert!(text.contains("Cancelar"), "{text}");
+    }
+
+    #[test]
+    fn pr_draft_modal_minimum_size() {
+        let mut app = make_app();
+        app.modal = Some(Modal::PrDraft {
+            base: "main".to_string(),
+            draft: crate::domain::commit::PullRequestDraft {
+                title: "T".to_string(),
+                body: "B".to_string(),
+            },
+            selected: 0,
+            scroll: 0,
+        });
+
+        let text = render_to_text(&app, 60, 18);
+
+        assert!(text.contains("Create PR"), "{text}");
+        assert!(text.contains("Cancel"), "{text}");
+    }
+
+    #[test]
+    fn conflict_resolution_modal_renders_actions() {
+        let mut app = make_app();
+        app.modal = Some(Modal::ConflictResolution {
+            file: "src/main.rs".to_string(),
+            conflict: "<<<<<<< HEAD\nfoo\n=======\nbar\n>>>>>>> branch".to_string(),
+            selected: 0,
+        });
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("Conflict"), "{text}");
+        assert!(text.contains("src/main.rs"), "{text}");
+    }
+
+    #[test]
+    fn existing_prs_modal_renders_pr_list() {
+        let mut app = make_app();
+        app.modal = Some(Modal::ExistingPrs {
+            prs: vec![
+                crate::domain::commit::PrInfo {
+                    number: 1,
+                    title: "Fix bug".to_string(),
+                    url: "https://github.com/test/repo/pull/1".to_string(),
+                    author: Some(crate::domain::commit::PrAuthor {
+                        login: "user".into(),
+                    }),
+                    body: None,
+                },
+                crate::domain::commit::PrInfo {
+                    number: 2,
+                    title: "Add feature".to_string(),
+                    url: "https://github.com/test/repo/pull/2".to_string(),
+                    author: Some(crate::domain::commit::PrAuthor {
+                        login: "dev".into(),
+                    }),
+                    body: None,
+                },
+            ],
+            base: "main".to_string(),
+            head: "feature".to_string(),
+            selected: 0,
+        });
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("Existing Pull Requests"), "{text}");
+        assert!(text.contains("Fix bug"), "{text}");
+        assert!(text.contains("Add feature"), "{text}");
+        assert!(text.contains("#1"), "{text}");
+        assert!(text.contains("#2"), "{text}");
+    }
+
+    #[test]
+    fn commit_plan_modal_renders_when_streaming() {
+        let mut app = make_app();
+        app.modal = Some(Modal::CommitPlan);
+        app.busy = true;
+        app.streaming_response = Some("Analyzing changes...".to_string());
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("Commit Plan"), "{text}");
+        assert!(text.contains("Analyzing changes..."), "{text}");
+    }
+
+    #[test]
+    fn text_input_modal_renders_model_name_input() {
+        let mut app = make_app();
+        app.modal = Some(Modal::TextInput {
+            kind: TextInputKind::ModelName,
+            buffer: "gpt-4.1".to_string(),
+            cursor: 7,
+            secret: false,
+        });
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("Model Name"), "{text}");
+        assert!(text.contains("gpt-4.1"), "{text}");
+    }
+
+    #[test]
+    fn text_input_modal_renders_api_key_input() {
+        let mut app = make_app();
+        app.modal = Some(Modal::TextInput {
+            kind: TextInputKind::ApiKey,
+            buffer: "sk-1234567890".to_string(),
+            cursor: 13,
+            secret: true,
+        });
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("API Key"), "{text}");
+        assert!(!text.contains("sk-1234567890"), "API key should be masked");
+    }
+
+    #[test]
+    fn history_limit_modal_renders_options() {
+        let mut app = make_app();
+        app.modal = Some(Modal::HistoryLimit);
+        app.core.config.history_limit = crate::domain::HistoryLimit::Medium;
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("History"), "{text}");
     }
 }

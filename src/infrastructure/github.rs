@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 
-use crate::domain::{PullRequestDraft, PrInfo};
+use crate::domain::{PrInfo, PullRequestDraft};
 use crate::error::{AppError, Result};
 
 #[derive(Clone)]
@@ -88,7 +88,7 @@ impl GitHubCli {
             "--state",
             "open",
             "--json",
-            "number,title,url",
+            "number,title,url,author,body",
         ])?;
         serde_json::from_str(&output)
             .map_err(|e| AppError::Custom(format!("Failed to parse PR list: {}", e)))

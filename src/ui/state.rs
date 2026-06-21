@@ -23,7 +23,7 @@ use crate::application::{AppCore, OllamaHealth, help_text};
 use crate::domain::commit::strip_emoji;
 use crate::domain::{
     CommitMessage, CommitPlan, FileEntry, Intent, IntentDecision, IntentParser, LlmContextUsage,
-    LlmProviderKind, PullRequestDraft, PrInfo, Suggestion, slash_suggestions,
+    LlmProviderKind, PrInfo, PullRequestDraft, Suggestion, slash_suggestions,
 };
 use crate::error::{AppError, Result};
 use crate::infrastructure::{
@@ -43,6 +43,7 @@ pub enum AppEvent {
     Mouse(MouseEvent),
     Tick,
     AsyncOutcome(Box<AsyncOutcome>),
+    SetBusyMessage(String),
 }
 
 pub enum AsyncOutcome {
@@ -399,6 +400,9 @@ impl TuiApp {
                 self.handle_mouse(mouse);
             }
             AppEvent::Tick => {}
+            AppEvent::SetBusyMessage(msg) => {
+                self.busy_message = msg;
+            }
             AppEvent::AsyncOutcome(outcome) => match *outcome {
                 AsyncOutcome::StreamingChunk(chunk) => {
                     if let Some(index) = self.streaming_response_index
@@ -1125,16 +1129,11 @@ impl TuiApp {
             | AsyncOutcome::DependencyCommandOutput(_)
             | AsyncOutcome::DependencyCommandFinished { .. } => {}
             AsyncOutcome::RemoteBranches(branches) => {
-                let lang = self.core.config.language.clone();
-                self.modal = Some(Modal::Picker {
-                    title: translate("Select PR base branch", &lang),
-                    items: branches
-                        .into_iter()
-                        .map(|branch| PickerItem {
-                            label: branch.clone(),
-                            value: PickerValue::PrBase(branch),
-                        })
-                        .collect(),
+                let current = self.core.status().branch.clone();
+                let filtered: Vec<_> = branches.into_iter().filter(|b| *b != current).collect();
+                self.modal = Some(Modal::PrBaseBranch {
+                    current_branch: current,
+                    branches: filtered,
                     selected: 0,
                 });
             }
@@ -1266,7 +1265,8 @@ impl TuiApp {
                     *selected = if *selected == 0 { 1 } else { 0 };
                 } else if let Some(Modal::ExistingPrs { selected, .. }) = self.modal.as_mut() {
                     prev_selected(selected, 3);
-                } else if let Some(Modal::ConflictResolution { selected, .. }) = self.modal.as_mut() {
+                } else if let Some(Modal::ConflictResolution { selected, .. }) = self.modal.as_mut()
+                {
                     prev_selected(selected, 3);
                 } else if matches!(self.modal, Some(Modal::OnboardingWizard { .. })) {
                     // Onboarding actions are list selections; horizontal arrows do not mutate state.
@@ -1301,7 +1301,8 @@ impl TuiApp {
                     *selected = if *selected == 0 { 1 } else { 0 };
                 } else if let Some(Modal::ExistingPrs { selected, .. }) = self.modal.as_mut() {
                     next_selected(selected, 3);
-                } else if let Some(Modal::ConflictResolution { selected, .. }) = self.modal.as_mut() {
+                } else if let Some(Modal::ConflictResolution { selected, .. }) = self.modal.as_mut()
+                {
                     next_selected(selected, 3);
                 } else if matches!(self.modal, Some(Modal::OnboardingWizard { .. })) {
                     // Onboarding actions are list selections; horizontal arrows do not mutate state.
@@ -1497,6 +1498,51 @@ impl TuiApp {
                 )
                 .await?
             }
+            Modal::PrBaseBranch {
+                current_branch,
+                branches,
+                selected,
+            } => {
+                if branches.is_empty() {
+                    self.modal = None;
+                    return Ok(());
+                }
+                let Some(base) = branches.get(selected).cloned() else {
+                    self.modal = None;
+                    return Ok(());
+                };
+                self.busy = true;
+                let lang = self.core.config.language.clone();
+                self.busy_message = translate("Checking for existing PRs...", &lang);
+                let mut core = self.core.clone();
+                tokio::spawn(async move {
+                    let head = current_branch;
+                    match core.list_open_prs(&head, &base) {
+                        Ok(prs) if !prs.is_empty() => {
+                            let outcome = AsyncOutcome::ExistingPrs(prs, base, head);
+                            let _ = tx.send(AppEvent::AsyncOutcome(Box::new(outcome))).await;
+                        }
+                        Ok(_) => {
+                            let can_merge = core.can_merge(&base);
+                            if can_merge {
+                                let outcome = match core.draft_pr(&base).await {
+                                    Ok(draft) => AsyncOutcome::PrDraft(base, draft),
+                                    Err(error) => AsyncOutcome::Error(error),
+                                };
+                                let _ = tx.send(AppEvent::AsyncOutcome(Box::new(outcome))).await;
+                            } else {
+                                let outcome = AsyncOutcome::MergeCheckResult(false, base);
+                                let _ = tx.send(AppEvent::AsyncOutcome(Box::new(outcome))).await;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = tx
+                                .send(AppEvent::AsyncOutcome(Box::new(AsyncOutcome::Error(error))))
+                                .await;
+                        }
+                    }
+                });
+            }
             Modal::PrDraft {
                 base,
                 draft,
@@ -1541,19 +1587,24 @@ impl TuiApp {
                     self.modal = None;
                     return Ok(());
                 }
-                let pr = &prs[selected];
-                let number = pr.number;
-                let is_recreate = selected == 1;
-                let is_cancel = selected == 2;
 
+                let is_cancel = selected >= 2;
                 if is_cancel {
                     self.modal = None;
                     self.push_assistant(translate("Cancelled.", &self.core.config.language));
                     return Ok(());
                 }
 
+                let Some(pr) = prs.first() else {
+                    self.modal = None;
+                    return Ok(());
+                };
+                let number = pr.number;
+                let is_recreate = selected == 1;
+
+                let lang = self.core.config.language.clone();
                 self.busy = true;
-                self.busy_message = translate("Drafting PR updates...", &self.core.config.language);
+                self.busy_message = translate("Drafting PR updates...", &lang);
                 let mut core = self.core.clone();
                 let base = base.clone();
                 let tx = tx.clone();
@@ -1561,22 +1612,76 @@ impl TuiApp {
                     match core.draft_pr(&base).await {
                         Ok(draft) => {
                             let result = if is_recreate {
-                                core.close_pr(number).and_then(|_| core.create_pr(&base, &draft))
+                                let close_msg = translate("Closing existing PR...", &lang);
+                                let _ = tx.send(AppEvent::SetBusyMessage(close_msg)).await;
+                                match tokio::task::spawn_blocking({
+                                    let core = core.clone();
+                                    move || core.close_pr(number)
+                                })
+                                .await
+                                {
+                                    Ok(Ok(_)) => {
+                                        let create_msg = translate("Creating new PR...", &lang);
+                                        let _ = tx.send(AppEvent::SetBusyMessage(create_msg)).await;
+                                        let base_clone = base.clone();
+                                        match tokio::task::spawn_blocking(move || {
+                                            core.create_pr(&base_clone, &draft)
+                                        })
+                                        .await
+                                        {
+                                            Ok(Ok(output)) => {
+                                                if output.is_empty() {
+                                                    AsyncOutcome::Message(translate(
+                                                        "PR closed and recreated successfully.",
+                                                        &lang,
+                                                    ))
+                                                } else {
+                                                    AsyncOutcome::Message(output)
+                                                }
+                                            }
+                                            Ok(Err(error)) => AsyncOutcome::Error(error),
+                                            Err(error) => AsyncOutcome::Error(AppError::Custom(
+                                                format!("Background task failed: {}", error),
+                                            )),
+                                        }
+                                    }
+                                    Ok(Err(error)) => AsyncOutcome::Error(error),
+                                    Err(error) => AsyncOutcome::Error(AppError::Custom(format!(
+                                        "Background task failed: {}",
+                                        error
+                                    ))),
+                                }
                             } else {
-                                core.edit_pr(number, &draft)
+                                let update_msg = translate("Updating PR...", &lang);
+                                let _ = tx.send(AppEvent::SetBusyMessage(update_msg)).await;
+                                match tokio::task::spawn_blocking(move || {
+                                    core.edit_pr(number, &draft)
+                                })
+                                .await
+                                {
+                                    Ok(Ok(output)) => {
+                                        if output.is_empty() {
+                                            AsyncOutcome::Message(translate(
+                                                "PR updated successfully.",
+                                                &lang,
+                                            ))
+                                        } else {
+                                            AsyncOutcome::Message(output)
+                                        }
+                                    }
+                                    Ok(Err(error)) => AsyncOutcome::Error(error),
+                                    Err(error) => AsyncOutcome::Error(AppError::Custom(format!(
+                                        "Background task failed: {}",
+                                        error
+                                    ))),
+                                }
                             };
-                            let outcome = match result {
-                                Ok(output) => AsyncOutcome::Message(if output.is_empty() {
-                                    "PR updated successfully.".to_string()
-                                } else {
-                                    output
-                                }),
-                                Err(error) => AsyncOutcome::Error(error),
-                            };
-                            let _ = tx.send(AppEvent::AsyncOutcome(Box::new(outcome))).await;
+                            let _ = tx.send(AppEvent::AsyncOutcome(Box::new(result))).await;
                         }
                         Err(error) => {
-                            let _ = tx.send(AppEvent::AsyncOutcome(Box::new(AsyncOutcome::Error(error)))).await;
+                            let _ = tx
+                                .send(AppEvent::AsyncOutcome(Box::new(AsyncOutcome::Error(error))))
+                                .await;
                         }
                     }
                 });
@@ -1599,9 +1704,14 @@ impl TuiApp {
                     }
                     1 => {
                         self.modal = None;
-                        self.push_assistant(translate("Please resolve conflicts manually, then run /pr again.", &lang));
+                        self.push_assistant(translate(
+                            "Please resolve conflicts manually, then run /pr again.",
+                            &lang,
+                        ));
                     }
-                    _ => { self.modal = None; }
+                    _ => {
+                        self.modal = None;
+                    }
                 }
             }
             Modal::Setup { selected } => self.activate_setup(selected).await?,
@@ -1678,38 +1788,6 @@ impl TuiApp {
                     self.onboarding_language_confirmed = true;
                     self.resume_onboarding_if_needed();
                 }
-            }
-            PickerValue::PrBase(base) => {
-                self.busy = true;
-                let lang = self.core.config.language.clone();
-                self.busy_message = translate("Checking for existing PRs...", &lang);
-                let mut core = self.core.clone();
-                let base = base.clone();
-                tokio::spawn(async move {
-                    let head = core.current_branch().unwrap_or_default();
-                    match core.list_open_prs(&head, &base) {
-                        Ok(prs) if !prs.is_empty() => {
-                            let outcome = AsyncOutcome::ExistingPrs(prs, base, head);
-                            let _ = tx.send(AppEvent::AsyncOutcome(Box::new(outcome))).await;
-                        }
-                        Ok(_) => {
-                            let can_merge = core.can_merge(&base);
-                            if can_merge {
-                                let outcome = match core.draft_pr(&base).await {
-                                    Ok(draft) => AsyncOutcome::PrDraft(base, draft),
-                                    Err(error) => AsyncOutcome::Error(error),
-                                };
-                                let _ = tx.send(AppEvent::AsyncOutcome(Box::new(outcome))).await;
-                            } else {
-                                let outcome = AsyncOutcome::MergeCheckResult(false, base);
-                                let _ = tx.send(AppEvent::AsyncOutcome(Box::new(outcome))).await;
-                            }
-                        }
-                        Err(error) => {
-                            let _ = tx.send(AppEvent::AsyncOutcome(Box::new(AsyncOutcome::Error(error)))).await;
-                        }
-                    }
-                });
             }
             PickerValue::Visibility { repo, private } => {
                 let lang = self.core.config.language.clone();
@@ -2322,6 +2400,9 @@ impl TuiApp {
             } => (selected, branches.total_count()),
             Modal::ProtectedBranchCommit { selected, .. } => (selected, 3),
             Modal::PrDraft { selected, .. } => (selected, 2),
+            Modal::PrBaseBranch {
+                selected, branches, ..
+            } => (selected, branches.len()),
             Modal::ExistingPrs { selected, .. } => (selected, 3),
             Modal::ConflictResolution { selected, .. } => (selected, 3),
             Modal::Setup { selected } => (selected, 4),
@@ -2408,42 +2489,25 @@ impl TuiApp {
     }
 
     fn current_onboarding_step(&self) -> Option<OnboardingStep> {
-        let status = self.core.status();
         let provider_selected = self.core.config.provider.is_selected();
         let api_key_missing = self.core.config.provider.uses_api_key()
-            && !self.core.api_key_configured().unwrap_or(false);
+            && matches!(self.core.api_key_configured(), Ok(false));
         let model_missing = self
             .core
             .config
             .model
             .as_deref()
             .is_none_or(|value| value.trim().is_empty());
-        let dependency_setup_missing = self.dependency_doctor.as_ref().is_some_and(|doctor| {
-            !doctor.git.is_ready()
-                || (self.core.config.provider == LlmProviderKind::Ollama
-                    && !doctor.ollama.is_ready())
-                || (provider_selected && !doctor.llm_provider.is_ready())
-        });
-        let has_pending_setup = dependency_setup_missing
-            || !status.is_repo
-            || (!status.has_origin && !self.onboarding_remote_deferred)
-            || !provider_selected
-            || api_key_missing
-            || model_missing;
-        if has_pending_setup && !self.onboarding_language_confirmed {
+        let ai_configured = provider_selected && !api_key_missing && !model_missing;
+
+        if ai_configured {
+            return None;
+        }
+
+        if !self.onboarding_language_confirmed {
             return Some(OnboardingStep::LanguageSelection);
         }
-        if let Some(doctor) = self.dependency_doctor.as_ref()
-            && !doctor.git.is_ready()
-        {
-            return Some(OnboardingStep::GitDependency(doctor.git.clone()));
-        }
-        if !status.is_repo {
-            return Some(OnboardingStep::RepoSetupChoice);
-        }
-        if !status.has_origin && !self.onboarding_remote_deferred {
-            return Some(OnboardingStep::RemoteSetupChoice);
-        }
+
         if !self.core.config.provider.is_selected() {
             return Some(OnboardingStep::ProviderSelection);
         }
@@ -2454,7 +2518,7 @@ impl TuiApp {
             return Some(OnboardingStep::ProviderDependency(doctor.ollama.clone()));
         }
         if self.core.config.provider.uses_api_key()
-            && !self.core.api_key_configured().unwrap_or(false)
+            && matches!(self.core.api_key_configured(), Ok(false))
         {
             return Some(OnboardingStep::ApiKeyConfiguration);
         }
@@ -2466,13 +2530,6 @@ impl TuiApp {
             .is_none_or(|value| value.trim().is_empty())
         {
             return Some(OnboardingStep::ModelConfiguration);
-        }
-        if let Some(doctor) = self.dependency_doctor.as_ref()
-            && !doctor.llm_provider.is_ready()
-        {
-            return Some(OnboardingStep::ProviderDependency(
-                doctor.llm_provider.clone(),
-            ));
         }
         None
     }
@@ -3359,6 +3416,13 @@ pub fn translate(text: &str, language: &str) -> String {
             "Dependency is still unavailable. Press Enter to review the suggested next step." => {
                 "La dependencia todavía no está disponible. Presiona Enter para revisar el siguiente paso sugerido."
             }
+            "Checking for existing PRs..." => "Verificando PRs existentes...",
+            "Drafting PR updates..." => "Generando actualización del PR...",
+            "Closing existing PR..." => "Cerrando PR existente...",
+            "Creating new PR..." => "Creando nuevo PR...",
+            "Updating PR..." => "Actualizando PR...",
+            "PR closed and recreated successfully." => "PR cerrado y recreado exitosamente.",
+            "PR updated successfully." => "PR actualizado exitosamente.",
             _ => text,
         },
         _ => text,
@@ -3369,48 +3433,41 @@ pub fn translate(text: &str, language: &str) -> String {
     } else {
         match lang_str {
             "spanish" | "español" | "espanol" => {
-                if text.starts_with("Model set to ") {
-                    let model = text.strip_prefix("Model set to ").unwrap();
+                if let Some(model) = text.strip_prefix("Model set to ") {
                     format!("Modelo configurado en {}.", model)
-                } else if text.starts_with("Language changed to ") {
-                    let language = text.strip_prefix("Language changed to ").unwrap();
+                } else if let Some(language) = text.strip_prefix("Language changed to ") {
                     format!("Idioma cambiado a {}", language)
-                } else if text.starts_with("GitHub repository `") && text.ends_with("` created.") {
-                    let repo = text
-                        .strip_prefix("GitHub repository `")
-                        .unwrap()
-                        .strip_suffix("` created.")
-                        .unwrap();
-                    format!("Repositorio GitHub `{}` creado.", repo)
-                } else if text.starts_with("Commit created:\n") {
-                    let title = text.strip_prefix("Commit created:\n").unwrap();
+                } else if let Some(rest) = text.strip_prefix("GitHub repository `") {
+                    if let Some(repo) = rest.strip_suffix("` created.") {
+                        format!("Repositorio GitHub `{}` creado.", repo)
+                    } else {
+                        text.to_string()
+                    }
+                } else if let Some(title) = text.strip_prefix("Commit created:\n") {
                     format!("Commit creado:\n{}", title)
-                } else if text.starts_with("Already on branch `") && text.ends_with("`.") {
-                    let branch = text
-                        .strip_prefix("Already on branch `")
-                        .unwrap()
-                        .strip_suffix("`.")
-                        .unwrap();
-                    format!("Ya estás en la rama `{}`.", branch)
-                } else if text.starts_with("Switched to branch `") && text.ends_with("`.") {
-                    let branch = text
-                        .strip_prefix("Switched to branch `")
-                        .unwrap()
-                        .strip_suffix("`.")
-                        .unwrap();
-                    format!("Cambiado a la rama `{}`.", branch)
-                } else if text.starts_with("You are on protected branch `")
-                    && text.ends_with("`. Committing directly here is unusual. Continue?")
-                {
-                    let branch = text
-                        .strip_prefix("You are on protected branch `")
-                        .unwrap()
-                        .strip_suffix("`. Committing directly here is unusual. Continue?")
-                        .unwrap();
-                    format!(
-                        "Estás en la rama protegida `{}`. Hacer commits directamente aquí no suele ser lo normal. ¿Continuar?",
-                        branch
-                    )
+                } else if let Some(rest) = text.strip_prefix("Already on branch `") {
+                    if let Some(branch) = rest.strip_suffix("`.") {
+                        format!("Ya estás en la rama `{}`.", branch)
+                    } else {
+                        text.to_string()
+                    }
+                } else if let Some(rest) = text.strip_prefix("Switched to branch `") {
+                    if let Some(branch) = rest.strip_suffix("`.") {
+                        format!("Cambiado a la rama `{}`.", branch)
+                    } else {
+                        text.to_string()
+                    }
+                } else if let Some(rest) = text.strip_prefix("You are on protected branch `") {
+                    if let Some(branch) =
+                        rest.strip_suffix("`. Committing directly here is unusual. Continue?")
+                    {
+                        format!(
+                            "Estás en la rama protegida `{}`. Hacer commits directamente aquí no suele ser lo normal. ¿Continuar?",
+                            branch
+                        )
+                    } else {
+                        text.to_string()
+                    }
                 } else {
                     text.to_string()
                 }
@@ -3495,6 +3552,11 @@ pub enum Modal {
         selected: usize,
         scroll: usize,
     },
+    PrBaseBranch {
+        current_branch: String,
+        branches: Vec<String>,
+        selected: usize,
+    },
     ExistingPrs {
         prs: Vec<PrInfo>,
         base: String,
@@ -3537,7 +3599,6 @@ pub enum PickerValue {
     Provider(String),
     Model(String),
     Language(String),
-    PrBase(String),
     Visibility { repo: String, private: bool },
     Theme(String),
 }
@@ -3562,8 +3623,11 @@ pub enum TextInputKind {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OnboardingStep {
     LanguageSelection,
+    #[allow(dead_code)]
     GitDependency(DependencyStatus),
+    #[allow(dead_code)]
     RepoSetupChoice,
+    #[allow(dead_code)]
     RemoteSetupChoice,
     ProviderSelection,
     ProviderDependency(DependencyStatus),
@@ -5443,7 +5507,7 @@ mod tests {
         assert!(matches!(
             app.modal,
             Some(Modal::OnboardingWizard {
-                step: OnboardingStep::GitDependency(_),
+                step: OnboardingStep::ProviderSelection,
                 ..
             })
         ));
@@ -5486,7 +5550,7 @@ mod tests {
         assert!(matches!(
             app.modal,
             Some(Modal::OnboardingWizard {
-                step: OnboardingStep::RepoSetupChoice,
+                step: OnboardingStep::ProviderSelection,
                 ..
             })
         ));
@@ -5630,7 +5694,7 @@ mod tests {
         assert!(matches!(
             app.modal,
             Some(Modal::OnboardingWizard {
-                step: OnboardingStep::RepoSetupChoice,
+                step: OnboardingStep::ProviderSelection,
                 ..
             })
         ));
@@ -5756,5 +5820,143 @@ mod tests {
         assert!(message.contains("LLM returned malformed JSON"));
         assert!(message.contains("Try Regenerate, /staged, or another model"));
         assert!(message.chars().count() < 360);
+    }
+
+    #[tokio::test]
+    async fn streaming_chunk_appends_to_response() {
+        let mut app = make_app();
+        app.modal = Some(Modal::CommitPlan);
+        app.busy = true;
+        app.streaming_response = Some("Hello".to_string());
+
+        app.apply_outcome(AsyncOutcome::StreamingChunk(" World".to_string()));
+
+        assert_eq!(app.streaming_response.as_deref(), Some("Hello World"));
+        assert!(app.busy);
+    }
+
+    #[tokio::test]
+    async fn stream_end_finalizes_response() {
+        let mut app = make_app();
+        app.modal = Some(Modal::CommitPlan);
+        app.busy = true;
+        app.streaming_response = Some("final content".to_string());
+
+        app.apply_outcome(AsyncOutcome::StreamEnd);
+
+        assert!(!app.busy);
+        assert!(app.streaming_response.is_some());
+    }
+
+    #[tokio::test]
+    async fn commit_created_clears_busy_and_adds_message() {
+        let mut app = make_app();
+        app.busy = true;
+        app.modal = Some(Modal::CommitPlan);
+        app.streaming_response = Some("old".to_string());
+        let msg = crate::domain::commit::CommitMessage {
+            hash: "abc1234".into(),
+            summary: "feat: test".into(),
+            body: None,
+            files_changed: 2,
+            insertions: 10,
+            deletions: 3,
+            co_authors: vec![],
+        };
+
+        app.apply_outcome(AsyncOutcome::CommitCreated(msg));
+
+        assert!(!app.busy);
+        assert!(app.history.iter().any(|m| m.text.contains("abc1234")));
+    }
+
+    #[tokio::test]
+    async fn merge_check_result_true_sets_can_merge() {
+        let mut app = make_app();
+        app.busy = true;
+
+        app.apply_outcome(AsyncOutcome::MergeCheckResult(true, "ok".into()));
+
+        assert!(!app.busy);
+        assert!(app.can_merge);
+    }
+
+    #[tokio::test]
+    async fn merge_check_result_false_sets_cannot_merge() {
+        let mut app = make_app();
+        app.busy = true;
+        app.can_merge = true;
+
+        app.apply_outcome(AsyncOutcome::MergeCheckResult(false, "conflict".into()));
+
+        assert!(!app.busy);
+        assert!(!app.can_merge);
+    }
+
+    #[tokio::test]
+    async fn existing_prs_opens_modal() {
+        let mut app = make_app();
+        app.busy = true;
+        let prs = vec![crate::domain::commit::PrInfo {
+            number: 1,
+            title: "Fix bug".into(),
+            url: "https://github.com/test/repo/pull/1".into(),
+            author: Some(crate::domain::commit::PrAuthor {
+                login: "user".into(),
+            }),
+            body: None,
+        }];
+
+        app.apply_outcome(AsyncOutcome::ExistingPrs(
+            prs,
+            "main".into(),
+            "feature".into(),
+        ));
+
+        assert!(!app.busy);
+        assert!(matches!(app.modal, Some(Modal::ExistingPrs { .. })));
+    }
+
+    #[tokio::test]
+    async fn commit_log_ready_updates_staged_view() {
+        let mut app = make_app();
+        app.busy = true;
+        app.modal = Some(Modal::CommitPlan);
+        let entries = vec![crate::domain::commit::CommitLogEntry {
+            hash: "deadbeef".into(),
+            summary: "initial commit".into(),
+            files_changed: 1,
+        }];
+
+        app.apply_outcome(AsyncOutcome::CommitLogReady(entries));
+
+        assert!(!app.busy);
+        assert!(app.staged_view.entries.len() == 1);
+    }
+
+    #[tokio::test]
+    async fn push_completed_adds_success_message() {
+        let mut app = make_app();
+        app.busy = true;
+
+        app.apply_outcome(AsyncOutcome::PushCompleted("Pushed to origin/main".into()));
+
+        assert!(!app.busy);
+        assert!(
+            app.history
+                .iter()
+                .any(|m| m.text.contains("Pushed to origin/main"))
+        );
+    }
+
+    #[tokio::test]
+    async fn error_outcome_clears_busy_and_shows_message() {
+        let mut app = make_app();
+        app.busy = true;
+
+        app.apply_outcome(AsyncOutcome::Error(AppError::GhMissing));
+
+        assert!(!app.busy);
+        assert!(app.history.iter().any(|m| m.role == ChatRole::System));
     }
 }
