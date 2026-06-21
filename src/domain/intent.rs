@@ -15,6 +15,8 @@ pub enum Intent {
     Pr,
     Explain,
     Review,
+    Status,
+    Log,
     Setup,
     Theme,
     Reset,
@@ -169,6 +171,21 @@ fn command_specs() -> Vec<CommandSpec> {
             intent: Intent::Review,
         },
         CommandSpec {
+            command: "/status",
+            description: "summarize changed files with AI",
+            intent: Intent::Status,
+        },
+        CommandSpec {
+            command: "/log",
+            description: "browse commit history",
+            intent: Intent::Log,
+        },
+        CommandSpec {
+            command: "/history",
+            description: "browse commit history",
+            intent: Intent::Log,
+        },
+        CommandSpec {
             command: "/setup",
             description: "initialize repo or remote",
             intent: Intent::Setup,
@@ -248,6 +265,18 @@ mod tests {
         assert!(matches!(
             IntentParser::parse("/review"),
             IntentDecision::Certain(Intent::Review)
+        ));
+        assert!(matches!(
+            IntentParser::parse("/status"),
+            IntentDecision::Certain(Intent::Status)
+        ));
+        assert!(matches!(
+            IntentParser::parse("/log"),
+            IntentDecision::Certain(Intent::Log)
+        ));
+        assert!(matches!(
+            IntentParser::parse("/history"),
+            IntentDecision::Certain(Intent::Log)
         ));
         assert!(matches!(
             IntentParser::parse("/pr"),
@@ -337,6 +366,8 @@ mod tests {
         assert!(suggestions.iter().any(|item| item.command == "/commit"));
         assert!(suggestions.iter().any(|item| item.command == "/config"));
         assert!(suggestions.iter().any(|item| item.command == "/resolve"));
+        assert!(suggestions.iter().any(|item| item.command == "/status"));
+        assert!(suggestions.iter().any(|item| item.command == "/log"));
         assert!(suggestions.iter().any(|item| item.command == "/exit"));
     }
 }

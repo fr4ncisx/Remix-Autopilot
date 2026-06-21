@@ -7,7 +7,7 @@ use tokio::sync::mpsc;
 
 use crate::domain::commit::{
     CommitGroup, FileEntry, commit_plan_prompt, explain_prompt, pr_prompt, review_prompt,
-    scout_question_prompt,
+    scout_question_prompt, status_prompt,
 };
 use crate::domain::{
     CommitMessage, CommitPlan, Config, DiffContext, Intent, LlmContextUsage, LlmProviderKind,
@@ -15,9 +15,9 @@ use crate::domain::{
 };
 use crate::error::{AppError, Result};
 use crate::infrastructure::{
-    BranchOption, ConfigRepository, DependencyDoctor, DependencyKind, DependencyStatus, Git,
-    GitHubCli, LlmClient, OllamaClient, PlatformInfo, RepoStatus, SecretsRepository,
-    SwitchBranches,
+    BranchOption, CommitLogEntry, ConfigRepository, DependencyDoctor, DependencyKind,
+    DependencyStatus, Git, GitHubCli, LlmClient, OllamaClient, PlatformInfo, RepoStatus,
+    SecretsRepository, SwitchBranches,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -555,6 +555,109 @@ impl AppCore {
             .await
     }
 
+    pub async fn status_summary_stream(
+        &mut self,
+        tx: mpsc::UnboundedSender<String>,
+    ) -> Result<String> {
+        if let Some(message) = self.clean_status_summary()? {
+            let _ = tx.send(message);
+            return Ok(String::new());
+        }
+
+        let context = self.diff_context()?;
+        if context.is_empty() {
+            return Err(AppError::NoChanges);
+        }
+        let model = self.ensure_model().await?;
+        let prompt = status_prompt(&self.config.language, &context);
+        let num_ctx = self.calculate_num_ctx(prompt.len());
+        self.llm
+            .generate_stream(
+                &self.config,
+                self.api_key()?.as_deref(),
+                &model,
+                &prompt,
+                num_ctx,
+                tx,
+            )
+            .await
+    }
+
+    fn clean_status_summary(&self) -> Result<Option<String>> {
+        self.ensure_repo()?;
+        let sync = self.git.working_tree_sync()?;
+        if sync.has_changes {
+            return Ok(None);
+        }
+
+        let branch = self
+            .git
+            .current_branch()
+            .unwrap_or_else(|_| "unknown".to_string());
+        let is_spanish = matches!(
+            self.config.language.to_lowercase().trim(),
+            "spanish" | "español" | "espanol"
+        );
+
+        let message = if !sync.has_upstream {
+            if is_spanish {
+                format!(
+                    "No hay cambios locales en `{branch}`. La rama no tiene upstream configurado; no usé IA."
+                )
+            } else {
+                format!(
+                    "No local changes on `{branch}`. This branch has no upstream configured; AI was not used."
+                )
+            }
+        } else if sync.ahead == 0 && sync.behind == 0 {
+            if is_spanish {
+                format!(
+                    "No hay cambios locales en `{branch}` y la rama está sincronizada con el remoto. No usé IA."
+                )
+            } else {
+                format!(
+                    "No local changes on `{branch}` and the branch is synced with remote. AI was not used."
+                )
+            }
+        } else if sync.ahead > 0 && sync.behind > 0 {
+            if is_spanish {
+                format!(
+                    "No hay cambios locales en `{branch}`, pero la rama diverge del remoto: {} commit(s) por subir y {} por traer. No usé IA.",
+                    sync.ahead, sync.behind
+                )
+            } else {
+                format!(
+                    "No local changes on `{branch}`, but the branch diverged from remote: {} commit(s) to push and {} to pull. AI was not used.",
+                    sync.ahead, sync.behind
+                )
+            }
+        } else if sync.ahead > 0 {
+            if is_spanish {
+                format!(
+                    "No hay cambios locales en `{branch}`, pero hay {} commit(s) pendientes de push. No usé IA.",
+                    sync.ahead
+                )
+            } else {
+                format!(
+                    "No local changes on `{branch}`, but there are {} commit(s) pending push. AI was not used.",
+                    sync.ahead
+                )
+            }
+        } else if is_spanish {
+            format!(
+                "No hay cambios locales en `{branch}`, pero hay {} commit(s) pendientes de pull. No usé IA.",
+                sync.behind
+            )
+        } else {
+            format!(
+                "No local changes on `{branch}`, but there are {} commit(s) pending pull. AI was not used.",
+                sync.behind
+            )
+        };
+
+        Ok(Some(message))
+    }
+
     pub async fn scout_question_stream(
         &mut self,
         question: &str,
@@ -621,6 +724,16 @@ impl AppCore {
     pub fn switch_branch(&self, branch: &BranchOption) -> Result<String> {
         self.ensure_repo()?;
         self.git.switch_to_branch(branch)
+    }
+
+    pub fn commit_log(&self) -> Result<Vec<CommitLogEntry>> {
+        self.ensure_repo()?;
+        self.git.commit_log(30)
+    }
+
+    pub fn reset_soft_to_commit(&self, hash: &str) -> Result<String> {
+        self.ensure_repo()?;
+        self.git.reset_soft_to(hash)
     }
 
     pub fn create_and_switch_branch(&self, name: &str) -> Result<String> {
@@ -1012,7 +1125,7 @@ pub fn help_text(language: &str) -> String {
         "spanish" | "español" | "espanol" => [
             "Usa comandos slash:",
             "/commit, /switch, /diff, /provider, /model, /lang, /staged, /push",
-            "/pr, /pull-request, /explain, /review, /setup, /theme, /config, /reset, /resolve, /help, /exit",
+            "/pr, /pull-request, /explain, /review, /status, /log, /history, /setup, /theme, /config, /reset, /resolve, /help, /exit",
             "",
             "Teclas: F2 configuración, Shift+Tab cambiar modo, / comandos, Enter enviar, Esc cancelar",
         ]
@@ -1020,7 +1133,7 @@ pub fn help_text(language: &str) -> String {
         _ => [
             "Use slash commands:",
             "/commit, /switch, /diff, /provider, /model, /lang, /staged, /push",
-            "/pr, /pull-request, /explain, /review, /setup, /theme, /config, /reset, /resolve, /help, /exit",
+            "/pr, /pull-request, /explain, /review, /status, /log, /history, /setup, /theme, /config, /reset, /resolve, /help, /exit",
             "",
             "Keys: F2 settings, Shift+Tab switch mode, / commands, Enter send, Esc cancel",
         ]
@@ -1064,6 +1177,32 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         String::from_utf8_lossy(&output.stdout).to_string()
+    }
+
+    #[test]
+    fn clean_status_summary_reports_no_ai_usage_without_local_changes() {
+        let dir = tempdir().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        git_in(dir.path(), &["config", "commit.gpgsign", "false"]);
+        git_in(dir.path(), &["config", "user.name", "Test User"]);
+        git_in(dir.path(), &["config", "user.email", "test@example.com"]);
+        fs::write(dir.path().join("README.md"), "base\n").unwrap();
+        git_in(dir.path(), &["add", "README.md"]);
+        git_in(dir.path(), &["commit", "-m", "base"]);
+
+        let core = AppCore::new(
+            dir.path().to_path_buf(),
+            crate::domain::Config::default(),
+            Client::new(),
+        );
+
+        let message = core
+            .clean_status_summary()
+            .unwrap()
+            .expect("expected local status summary");
+
+        assert!(message.contains("No local changes on `main`"), "{message}");
+        assert!(message.contains("AI was not used"), "{message}");
     }
 
     #[test]

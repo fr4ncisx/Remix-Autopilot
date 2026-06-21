@@ -484,6 +484,25 @@ pub fn review_prompt(language: &str, context: &DiffContext) -> String {
     )
 }
 
+pub fn status_prompt(language: &str, context: &DiffContext) -> String {
+    format!(
+        "Summarize the current Git working tree in {} for a CLI user. Do not use emojis. Be direct and practical.\n\n\
+         Required format:\n\
+         - Start with one short sentence saying whether there are changes to handle.\n\
+         - Then list each changed file as `file path: lines/range - what changed`.\n\
+         - Use line numbers or hunk ranges from the diff when available, for example `@@ -10,2 +10,5 @@`; if exact lines are not available, say `lines unknown`.\n\
+         - Mention untracked, staged, unstaged, deleted, or renamed state when visible from STATUS.\n\
+         - Do not include commit suggestions unless the user asks.\n\n\
+         STATUS:\n{}\n\nSTAT:\n{}\n\nDIFF:\n{}{}{}",
+        language,
+        context.status,
+        context.stat,
+        context.diff,
+        context.truncation_warning(language),
+        language_reinforcement(language)
+    )
+}
+
 fn language_reinforcement(language: &str) -> String {
     match language.to_lowercase().trim() {
         "spanish" | "español" | "espanol" => {
@@ -644,6 +663,24 @@ pub fn scout_question_prompt(language: &str, context: &DiffContext, question: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn status_prompt_requests_file_line_ranges_and_change_summary() {
+        let context = DiffContext {
+            status: " M src/main.rs\n?? docs/new.md".to_string(),
+            stat: " src/main.rs | 4 ++--".to_string(),
+            diff: "diff --git a/src/main.rs b/src/main.rs\n@@ -10,2 +10,4 @@ fn main() {}\n+println!(\"hi\");".to_string(),
+            truncated: false,
+        };
+
+        let prompt = status_prompt("Spanish", &context);
+
+        assert!(prompt.contains("file path: lines/range - what changed"));
+        assert!(prompt.contains("lines unknown"));
+        assert!(prompt.contains("STATUS:"));
+        assert!(prompt.contains("@@ -10,2 +10,4 @@"));
+        assert!(prompt.contains("CRITICAL"));
+    }
 
     #[test]
     fn parses_commit_message_from_json_response() {
