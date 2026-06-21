@@ -8,7 +8,7 @@ pub enum Intent {
     Lang(Option<String>),
     Switch,
     Staged,
-    Diff,
+    Diff(Option<String>),
     DeprecatedDryRun,
     Commit,
     Push,
@@ -47,6 +47,15 @@ impl IntentParser {
         }
         if trimmed == "/dry-run" {
             return IntentDecision::Certain(Intent::DeprecatedDryRun);
+        }
+        if trimmed == "/diff" {
+            return IntentDecision::Certain(Intent::Diff(None));
+        }
+        if let Some(branch) = trimmed.strip_prefix("/diff ") {
+            let branch = branch.trim().to_string();
+            if !branch.is_empty() {
+                return IntentDecision::Certain(Intent::Diff(Some(branch)));
+            }
         }
 
         command_specs()
@@ -118,7 +127,7 @@ fn command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             command: "/diff",
             description: "show changed files",
-            intent: Intent::Diff,
+            intent: Intent::Diff(None),
         },
         CommandSpec {
             command: "/provider",

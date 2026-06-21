@@ -6,8 +6,8 @@ use reqwest::Client;
 use tokio::sync::mpsc;
 
 use crate::domain::commit::{
-    CommitGroup, FileEntry, commit_plan_prompt, explain_prompt, pr_prompt, resolve_conflict_prompt,
-    review_prompt, scout_question_prompt, status_prompt,
+    CommitGroup, FileEntry, commit_plan_prompt, diff_explanation_prompt, explain_prompt, pr_prompt,
+    resolve_conflict_prompt, review_prompt, scout_question_prompt, status_prompt,
 };
 use crate::domain::{
     CommitMessage, CommitPlan, Config, DiffContext, Intent, LlmContextUsage, LlmProviderKind,
@@ -556,6 +556,66 @@ impl AppCore {
             .await
     }
 
+    pub async fn diff_stream(
+        &mut self,
+        tx: mpsc::UnboundedSender<String>,
+        branch_opt: Option<String>,
+    ) -> Result<String> {
+        let (context, target_name) = if let Some(ref branch) = branch_opt {
+            let (max_chars, context_lines) = self.diff_limits();
+            let res = self.git.branch_diff_context(branch, max_chars, context_lines);
+            match res {
+                Ok(ctx) => (ctx, branch.clone()),
+                Err(_) => {
+                    let msg = match self.config.language.to_lowercase().trim() {
+                        "spanish" | "español" | "espanol" => format!("La rama '{}' no existe en el repositorio.", branch),
+                        _ => format!("The branch '{}' does not exist in the repository.", branch),
+                    };
+                    let _ = tx.send(msg);
+                    return Ok(String::new());
+                }
+            }
+        } else {
+            let target = match self.config.language.to_lowercase().trim() {
+                "spanish" | "español" | "espanol" => "los cambios locales".to_string(),
+                _ => "local changes".to_string(),
+            };
+            (self.diff_context()?, target)
+        };
+
+        if context.is_empty() {
+            let msg = match self.config.language.to_lowercase().trim() {
+                "spanish" | "español" | "espanol" => format!("No hay diferencias {}. Los estados son idénticos.", target_name),
+                _ => format!("No differences found {}. Both states are identical.", target_name),
+            };
+            let _ = tx.send(msg);
+            return Ok(String::new());
+        }
+
+        let model = self.ensure_model().await?;
+        let current_branch = self
+            .git
+            .current_branch()
+            .unwrap_or_else(|_| "current".to_string());
+        let prompt = diff_explanation_prompt(
+            &self.config.language,
+            &context,
+            &current_branch,
+            &target_name,
+        );
+        let num_ctx = self.calculate_num_ctx(prompt.len());
+        self.llm
+            .generate_stream(
+                &self.config,
+                self.api_key()?.as_deref(),
+                &model,
+                &prompt,
+                num_ctx,
+                tx,
+            )
+            .await
+    }
+
     pub async fn status_summary_stream(
         &mut self,
         tx: mpsc::UnboundedSender<String>,
@@ -865,13 +925,9 @@ impl AppCore {
                 };
                 Ok(msg)
             }
-            Intent::Diff => {
-                let context = self.diff_context()?;
-                if context.is_empty() {
-                    Err(AppError::NoChanges)
-                } else {
-                    Ok(context.summary(&self.config.language))
-                }
+            Intent::Diff(_) => {
+                // This is now handled in diff_stream asynchronously.
+                Ok(String::new())
             }
             Intent::DeprecatedDryRun => Ok(match self.config.language.to_lowercase().trim() {
                 "spanish" | "español" | "espanol" => {

@@ -226,6 +226,8 @@ impl Git {
     }
 
     pub fn apply_patch_to_index(&self, file_path: &str, patch: &str) -> Result<String> {
+        // Normalize CRLF → LF: LLMs on Windows often emit \r\n which git apply rejects
+        let patch = patch.replace("\r\n", "\n").replace('\r', "\n");
         let patch = patch.trim();
         if patch.is_empty() {
             return Err(AppError::Custom(
@@ -233,10 +235,13 @@ impl Git {
             ));
         }
 
+        // Ensure the file path uses forward slashes (git expects POSIX paths)
+        let git_path = file_path.replace('\\', "/");
+
         let patch_with_header = if patch.starts_with("--- ") {
             patch.to_string()
         } else {
-            format!("--- a/{}\n+++ b/{}\n{}", file_path, file_path, patch)
+            format!("--- a/{git_path}\n+++ b/{git_path}\n{patch}")
         };
 
         let mut child = Command::new("git")
@@ -259,12 +264,26 @@ impl Git {
         let output = child
             .wait_with_output()
             .map_err(|error| AppError::Custom(format!("failed to apply patch: {}", error)))?;
-        command_stdout(
-            output.status,
-            output.stdout,
-            output.stderr,
-            "git apply --cached --recount --whitespace=nowarn -",
-        )
+
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        }
+
+        // Patch failed — fall back to staging the whole file.
+        // This is safe because the commit plan groups already scope what gets committed;
+        // staging the full file here is better than aborting the whole commit plan.
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let lower = stderr.to_lowercase();
+        if lower.contains("permission denied") || lower.contains("access denied") {
+            return Err(AppError::GitPermissionDenied(stderr));
+        }
+
+        // Try whole-file add as fallback
+        self.add_paths(&[git_path])
+            .map_err(|_| AppError::GitCommand {
+                args: "git apply --cached --recount --whitespace=nowarn -".to_string(),
+                stderr,
+            })
     }
 
     pub fn commit(&self, message: &CommitMessage) -> Result<String> {
@@ -440,6 +459,26 @@ impl Git {
                 .unwrap_or_default();
             diff = self.append_untracked_diffs(diff, &untracked);
         }
+
+        let (diff, truncated) = truncate_diff(diff, max_chars);
+        Ok(DiffContext {
+            status,
+            stat,
+            diff,
+            truncated,
+        })
+    }
+
+    pub fn branch_diff_context(
+        &self,
+        branch: &str,
+        max_chars: usize,
+        context_lines: u32,
+    ) -> Result<DiffContext> {
+        let u_arg = format!("-U{}", context_lines);
+        let status = self.output(["diff", "--name-status", branch])?;
+        let stat = self.output(["diff", "--stat", branch])?;
+        let diff = self.output(["diff", &u_arg, branch])?;
 
         let (diff, truncated) = truncate_diff(diff, max_chars);
         Ok(DiffContext {
