@@ -102,3 +102,200 @@ pub enum AppError {
     #[error("{0}")]
     Custom(String),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn display_config_dir() {
+        let error = AppError::ConfigDir;
+        assert!(error.to_string().contains("config directory"));
+    }
+
+    #[test]
+    fn display_git_missing() {
+        let error = AppError::GitMissing;
+        assert!(error.to_string().contains("git"));
+        assert!(error.to_string().contains("not installed"));
+    }
+
+    #[test]
+    fn display_not_git_repo() {
+        let error = AppError::NotGitRepo;
+        assert!(error.to_string().contains("not a Git repository"));
+    }
+
+    #[test]
+    fn display_origin_missing() {
+        let error = AppError::OriginMissing;
+        assert!(error.to_string().contains("origin"));
+    }
+
+    #[test]
+    fn display_no_changes() {
+        let error = AppError::NoChanges;
+        assert!(error.to_string().contains("no changes"));
+    }
+
+    #[test]
+    fn display_provider_not_selected() {
+        let error = AppError::ProviderNotSelected;
+        assert!(error.to_string().contains("provider"));
+    }
+
+    #[test]
+    fn display_missing_model_shows_provider() {
+        let error = AppError::MissingModel {
+            provider: "Gemini".to_string(),
+        };
+        assert!(error.to_string().contains("Gemini"));
+        assert!(error.to_string().contains("model"));
+    }
+
+    #[test]
+    fn display_missing_api_key_shows_provider() {
+        let error = AppError::MissingApiKey {
+            provider: "OpenAI".to_string(),
+        };
+        assert!(error.to_string().contains("OpenAI"));
+        assert!(error.to_string().contains("API key"));
+    }
+
+    #[test]
+    fn display_custom_shows_message() {
+        let error = AppError::Custom("test error".into());
+        assert_eq!(error.to_string(), "test error");
+    }
+
+    #[test]
+    fn display_empty_remote_url() {
+        let error = AppError::EmptyRemoteUrl;
+        assert!(error.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn display_empty_repository_name() {
+        let error = AppError::EmptyRepositoryName;
+        assert!(error.to_string().contains("empty"));
+    }
+
+    #[test]
+    fn display_gh_missing() {
+        let error = AppError::GhMissing;
+        assert!(error.to_string().contains("gh"));
+        assert!(error.to_string().contains("not installed"));
+    }
+
+    #[test]
+    fn display_gh_auth_missing() {
+        let error = AppError::GhAuthMissing;
+        assert!(error.to_string().contains("not authenticated"));
+    }
+
+    #[test]
+    fn display_no_ollama_models() {
+        let error = AppError::NoOllamaModels;
+        assert!(error.to_string().contains("no Ollama models"));
+    }
+
+    #[test]
+    fn display_invalid_llm_response() {
+        let error = AppError::InvalidLlmResponse("bad response".into());
+        assert!(error.to_string().contains("invalid LLM response"));
+        assert!(error.to_string().contains("bad response"));
+    }
+
+    #[test]
+    fn display_secret_store() {
+        let error = AppError::SecretStore("keyring failed".into());
+        assert!(error.to_string().contains("secret store"));
+        assert!(error.to_string().contains("keyring failed"));
+    }
+
+    #[test]
+    fn display_detached_head() {
+        let error = AppError::DetachedHead;
+        assert!(error.to_string().contains("detached HEAD"));
+    }
+
+    #[test]
+    fn display_git_identity_missing() {
+        let error = AppError::GitIdentityMissing;
+        assert!(error.to_string().contains("user.name"));
+    }
+
+    #[test]
+    fn display_git_command_shows_args_and_stderr() {
+        let error = AppError::GitCommand {
+            args: "status".to_string(),
+            stderr: "fatal: not a git repository".to_string(),
+        };
+        let msg = error.to_string();
+        assert!(msg.contains("status"));
+        assert!(msg.contains("fatal: not a git repository"));
+    }
+
+    #[test]
+    fn display_git_push_auth_shows_credentials_hint() {
+        let error = AppError::GitPushAuth {
+            args: "origin main".to_string(),
+            stderr: "authentication failed".to_string(),
+        };
+        let msg = error.to_string();
+        assert!(msg.contains("authentication"));
+        assert!(msg.contains("gh auth login"));
+    }
+
+    #[test]
+    fn display_git_push_no_upstream() {
+        let error = AppError::GitPushNoUpstream {
+            args: "origin main".to_string(),
+            stderr: "no upstream branch".to_string(),
+        };
+        let msg = error.to_string();
+        assert!(msg.contains("no upstream"));
+    }
+
+    #[test]
+    fn display_ollama_http() {
+        let error = AppError::OllamaHttp(503);
+        assert!(error.to_string().contains("503"));
+    }
+
+    #[test]
+    fn display_provider_http_shows_provider_and_status() {
+        let error = AppError::ProviderHttp {
+            provider: "Gemini".to_string(),
+            status: 429,
+        };
+        let msg = error.to_string();
+        assert!(msg.contains("Gemini"));
+        assert!(msg.contains("429"));
+    }
+
+    #[test]
+    fn display_missing_base_url_shows_provider() {
+        let error = AppError::MissingBaseUrl {
+            provider: "Anthropic".to_string(),
+        };
+        assert!(error.to_string().contains("Anthropic"));
+        assert!(error.to_string().contains("base URL"));
+    }
+
+    #[test]
+    fn display_config_parse_shows_error() {
+        let json_error = serde_json::from_str::<serde_json::Value>("invalid").unwrap_err();
+        let error = AppError::ConfigParse(json_error);
+        assert!(error.to_string().contains("failed to parse config"));
+    }
+
+    #[test]
+    fn display_json_serialize_shows_error() {
+        let mut map = std::collections::HashMap::new();
+        map.insert(vec![1, 2], 3);
+        let json_err = serde_json::to_string(&map).unwrap_err();
+        let error = AppError::JsonSerialize(json_err);
+        assert!(error.to_string().contains("failed to serialize JSON"));
+    }
+}

@@ -8,15 +8,19 @@ pub enum Intent {
     Lang(Option<String>),
     Switch,
     Staged,
-    Diff,
+    Diff(Option<String>),
     DeprecatedDryRun,
     Commit,
     Push,
     Pr,
     Explain,
     Review,
+    Status,
+    Log,
     Setup,
     Theme,
+    Reset,
+    Resolve,
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +47,15 @@ impl IntentParser {
         }
         if trimmed == "/dry-run" {
             return IntentDecision::Certain(Intent::DeprecatedDryRun);
+        }
+        if trimmed == "/diff" {
+            return IntentDecision::Certain(Intent::Diff(None));
+        }
+        if let Some(branch) = trimmed.strip_prefix("/diff ") {
+            let branch = branch.trim().to_string();
+            if !branch.is_empty() {
+                return IntentDecision::Certain(Intent::Diff(Some(branch)));
+            }
         }
 
         command_specs()
@@ -75,7 +88,6 @@ pub fn slash_suggestions(input: &str) -> Vec<Suggestion> {
             .cmp(&left.score)
             .then_with(|| left.command.cmp(right.command))
     });
-    suggestions.truncate(8);
     suggestions
 }
 
@@ -115,7 +127,7 @@ fn command_specs() -> Vec<CommandSpec> {
         CommandSpec {
             command: "/diff",
             description: "show changed files",
-            intent: Intent::Diff,
+            intent: Intent::Diff(None),
         },
         CommandSpec {
             command: "/provider",
@@ -168,6 +180,21 @@ fn command_specs() -> Vec<CommandSpec> {
             intent: Intent::Review,
         },
         CommandSpec {
+            command: "/status",
+            description: "summarize changed files with AI",
+            intent: Intent::Status,
+        },
+        CommandSpec {
+            command: "/log",
+            description: "browse commit history",
+            intent: Intent::Log,
+        },
+        CommandSpec {
+            command: "/history",
+            description: "browse commit history",
+            intent: Intent::Log,
+        },
+        CommandSpec {
             command: "/setup",
             description: "initialize repo or remote",
             intent: Intent::Setup,
@@ -176,6 +203,16 @@ fn command_specs() -> Vec<CommandSpec> {
             command: "/theme",
             description: "change UI theme color palette",
             intent: Intent::Theme,
+        },
+        CommandSpec {
+            command: "/reset",
+            description: "reset configuration and disconnect origin safely",
+            intent: Intent::Reset,
+        },
+        CommandSpec {
+            command: "/resolve",
+            description: "resolve the next pending setup or dependency issue",
+            intent: Intent::Resolve,
         },
         CommandSpec {
             command: "/config",
@@ -239,12 +276,32 @@ mod tests {
             IntentDecision::Certain(Intent::Review)
         ));
         assert!(matches!(
+            IntentParser::parse("/status"),
+            IntentDecision::Certain(Intent::Status)
+        ));
+        assert!(matches!(
+            IntentParser::parse("/log"),
+            IntentDecision::Certain(Intent::Log)
+        ));
+        assert!(matches!(
+            IntentParser::parse("/history"),
+            IntentDecision::Certain(Intent::Log)
+        ));
+        assert!(matches!(
             IntentParser::parse("/pr"),
             IntentDecision::Certain(Intent::Pr)
         ));
         assert!(matches!(
             IntentParser::parse("/pull-request"),
             IntentDecision::Certain(Intent::Pr)
+        ));
+        assert!(matches!(
+            IntentParser::parse("/reset"),
+            IntentDecision::Certain(Intent::Reset)
+        ));
+        assert!(matches!(
+            IntentParser::parse("/resolve"),
+            IntentDecision::Certain(Intent::Resolve)
         ));
     }
 
@@ -283,6 +340,9 @@ mod tests {
 
         let suggestions = slash_suggestions("/sw");
         assert_eq!(suggestions[0].command, "/switch");
+
+        let suggestions = slash_suggestions("/res");
+        assert!(matches!(suggestions[0].command, "/reset" | "/resolve"));
     }
 
     #[test]
@@ -306,5 +366,17 @@ mod tests {
                 .iter()
                 .all(|item| item.command != "/dry-run")
         );
+    }
+
+    #[test]
+    fn bare_slash_lists_all_available_commands() {
+        let suggestions = slash_suggestions("/");
+        assert!(suggestions.len() > 8);
+        assert!(suggestions.iter().any(|item| item.command == "/commit"));
+        assert!(suggestions.iter().any(|item| item.command == "/config"));
+        assert!(suggestions.iter().any(|item| item.command == "/resolve"));
+        assert!(suggestions.iter().any(|item| item.command == "/status"));
+        assert!(suggestions.iter().any(|item| item.command == "/log"));
+        assert!(suggestions.iter().any(|item| item.command == "/exit"));
     }
 }

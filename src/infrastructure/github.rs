@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::process::{Command, ExitStatus};
 
-use crate::domain::PullRequestDraft;
+use crate::domain::{PrInfo, PullRequestDraft};
 use crate::error::{AppError, Result};
 
 #[derive(Clone)]
@@ -56,6 +56,42 @@ impl GitHubCli {
             "--body",
             &draft.body,
         ])
+    }
+
+    pub fn edit_pr(&self, number: i64, draft: &PullRequestDraft) -> Result<String> {
+        self.ensure_ready()?;
+        self.output([
+            "pr",
+            "edit",
+            &number.to_string(),
+            "--title",
+            &draft.title,
+            "--body",
+            &draft.body,
+        ])
+    }
+
+    pub fn close_pr(&self, number: i64) -> Result<String> {
+        self.ensure_ready()?;
+        self.output(["pr", "close", &number.to_string()])
+    }
+
+    pub fn list_open_prs(&self, head: &str, base: &str) -> Result<Vec<PrInfo>> {
+        self.ensure_ready()?;
+        let output = self.output([
+            "pr",
+            "list",
+            "--head",
+            head,
+            "--base",
+            base,
+            "--state",
+            "open",
+            "--json",
+            "number,title,url,author,body",
+        ])?;
+        serde_json::from_str(&output)
+            .map_err(|e| AppError::Custom(format!("Failed to parse PR list: {}", e)))
     }
 
     fn output<const N: usize>(&self, args: [&str; N]) -> Result<String> {

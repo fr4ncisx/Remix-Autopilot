@@ -793,4 +793,174 @@ mod tests {
         assert!(action.runnable_in_cli);
         assert!(action.command.is_some());
     }
+
+    #[test]
+    fn is_ready_true_for_ready_state() {
+        let platform = PlatformInfo {
+            os: PlatformOs::Linux,
+            package_manager: Some(PackageManager::AptGet),
+            is_elevated: false,
+        };
+        let status = DependencyStatus::ready(DependencyKind::Git, &platform, Some("2.40".into()));
+        assert!(status.is_ready());
+    }
+
+    #[test]
+    fn is_ready_false_for_missing_state() {
+        let platform = PlatformInfo {
+            os: PlatformOs::Windows,
+            package_manager: Some(PackageManager::Winget),
+            is_elevated: false,
+        };
+        let status = DependencyStatus::missing(DependencyKind::Git, &platform, None);
+        assert!(!status.is_ready());
+    }
+
+    #[test]
+    fn is_blocking_true_for_git_missing() {
+        let platform = PlatformInfo {
+            os: PlatformOs::Linux,
+            package_manager: Some(PackageManager::AptGet),
+            is_elevated: false,
+        };
+        let status = DependencyStatus::missing(DependencyKind::Git, &platform, None);
+        assert!(status.is_blocking());
+    }
+
+    #[test]
+    fn is_blocking_false_for_git_ready() {
+        let platform = PlatformInfo {
+            os: PlatformOs::Linux,
+            package_manager: Some(PackageManager::AptGet),
+            is_elevated: false,
+        };
+        let status = DependencyStatus::ready(DependencyKind::Git, &platform, Some("2.40".into()));
+        assert!(!status.is_blocking());
+    }
+
+    #[test]
+    fn is_blocking_false_for_non_git_missing() {
+        let platform = PlatformInfo {
+            os: PlatformOs::Linux,
+            package_manager: Some(PackageManager::AptGet),
+            is_elevated: false,
+        };
+        let status = DependencyStatus::missing(DependencyKind::GitHubCli, &platform, None);
+        assert!(!status.is_blocking());
+    }
+
+    #[test]
+    fn recovery_action_returns_install_for_git_missing() {
+        let platform = PlatformInfo {
+            os: PlatformOs::MacOs,
+            package_manager: Some(PackageManager::Homebrew),
+            is_elevated: false,
+        };
+        let status = DependencyStatus::missing(DependencyKind::Git, &platform, None);
+        let action = status.recovery_action().unwrap();
+        assert_eq!(action.kind, DependencyActionKind::Install);
+        assert!(action.title.contains("Git"));
+    }
+
+    #[test]
+    fn recovery_action_returns_pull_for_ollama_no_models() {
+        let platform = PlatformInfo {
+            os: PlatformOs::Linux,
+            package_manager: Some(PackageManager::AptGet),
+            is_elevated: false,
+        };
+        let status = DependencyStatus::ollama_no_models(&platform, None);
+        let action = status.recovery_action().unwrap();
+        assert_eq!(action.kind, DependencyActionKind::PullModel);
+    }
+
+    #[test]
+    fn recovery_action_returns_manual_auth_for_gh_auth() {
+        let platform = PlatformInfo {
+            os: PlatformOs::Windows,
+            package_manager: Some(PackageManager::Winget),
+            is_elevated: false,
+        };
+        let status = DependencyStatus::gh_auth_missing(&platform, None);
+        let action = status.recovery_action().unwrap();
+        assert_eq!(action.kind, DependencyActionKind::ManualAuth);
+    }
+
+    #[test]
+    fn recovery_action_returns_none_for_ready() {
+        let platform = PlatformInfo {
+            os: PlatformOs::Linux,
+            package_manager: Some(PackageManager::AptGet),
+            is_elevated: false,
+        };
+        let status = DependencyStatus::ready(DependencyKind::Git, &platform, None);
+        assert!(status.recovery_action().is_none());
+    }
+
+    #[test]
+    fn platform_os_label_matches_variant() {
+        assert_eq!(PlatformOs::Windows.label(), "Windows");
+        assert_eq!(PlatformOs::MacOs.label(), "macOS");
+        assert_eq!(PlatformOs::Linux.label(), "Linux");
+        assert_eq!(PlatformOs::Other.label(), "Other");
+    }
+
+    #[test]
+    fn package_manager_label_matches_variant() {
+        assert_eq!(PackageManager::Winget.label(), "winget");
+        assert_eq!(PackageManager::Chocolatey.label(), "choco");
+        assert_eq!(PackageManager::Homebrew.label(), "brew");
+        assert_eq!(PackageManager::AptGet.label(), "apt-get");
+        assert_eq!(PackageManager::Dnf.label(), "dnf");
+        assert_eq!(PackageManager::Pacman.label(), "pacman");
+        assert_eq!(PackageManager::Zypper.label(), "zypper");
+    }
+
+    #[test]
+    fn ollama_not_running_suggests_serve_command() {
+        let platform = PlatformInfo {
+            os: PlatformOs::Linux,
+            package_manager: Some(PackageManager::AptGet),
+            is_elevated: false,
+        };
+        let status = DependencyStatus::ollama_not_running(
+            &platform,
+            Some("0.9.0".into()),
+            "not running".into(),
+        );
+        assert_eq!(status.state, DependencyState::NotRunning);
+        assert_eq!(status.suggested_command.as_deref(), Some("ollama serve"));
+    }
+
+    #[test]
+    fn llm_provider_not_configured_has_detail() {
+        let platform = PlatformInfo {
+            os: PlatformOs::Windows,
+            package_manager: Some(PackageManager::Winget),
+            is_elevated: false,
+        };
+        let status = DependencyStatus::llm_provider_not_configured(
+            &platform,
+            "No API key configured".into(),
+            Some("https://example.com"),
+        );
+        assert_eq!(status.state, DependencyState::NotConfigured);
+        assert_eq!(status.kind, DependencyKind::LlmProvider);
+        assert!(status.detail.unwrap().contains("No API key"));
+        assert!(status.suggested_command.is_none());
+    }
+
+    #[test]
+    fn install_command_uses_apt_get_on_linux() {
+        let platform = PlatformInfo {
+            os: PlatformOs::Linux,
+            package_manager: Some(PackageManager::AptGet),
+            is_elevated: false,
+        };
+        let status = DependencyStatus::missing(DependencyKind::Git, &platform, None);
+        assert_eq!(
+            status.suggested_command.as_deref(),
+            Some("sudo apt-get install -y git")
+        );
+    }
 }

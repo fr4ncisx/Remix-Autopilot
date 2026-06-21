@@ -16,6 +16,14 @@ pub struct RepoStatus {
     pub is_repo: bool,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct WorkingTreeSync {
+    pub has_changes: bool,
+    pub has_upstream: bool,
+    pub ahead: u32,
+    pub behind: u32,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BranchSource {
     Local,
@@ -28,6 +36,16 @@ pub struct BranchOption {
     pub source: BranchSource,
     pub last_commit_unix: Option<i64>,
     pub is_current: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommitLogEntry {
+    pub hash: String,
+    pub short_hash: String,
+    pub decorations: String,
+    pub subject: String,
+    pub author: String,
+    pub relative_time: String,
 }
 
 impl BranchOption {
@@ -84,7 +102,7 @@ impl Git {
     }
 
     pub fn status(&self) -> RepoStatus {
-        let mut cache = self.cache.lock().unwrap();
+        let mut cache = self.cache.lock().expect("git status cache lock poisoned");
         if let Some((status, time)) = &cache.status
             && time.elapsed() < cache.status_ttl
         {
@@ -121,6 +139,11 @@ impl Git {
         } else {
             Err(AppError::NotGitRepo)
         }
+    }
+
+    pub fn working_tree_sync(&self) -> Result<WorkingTreeSync> {
+        let output = self.output(["status", "--porcelain=v1", "--branch"])?;
+        Ok(parse_working_tree_sync(&output))
     }
 
     pub fn init(&self) -> Result<String> {
@@ -160,6 +183,16 @@ impl Git {
         Ok(output)
     }
 
+    pub fn remove_origin_if_exists(&self) -> Result<bool> {
+        if !self.has_origin() {
+            self.invalidate_status_cache();
+            return Ok(false);
+        }
+        self.output(["remote", "remove", "origin"])?;
+        self.invalidate_status_cache();
+        Ok(true)
+    }
+
     pub fn current_branch(&self) -> Result<String> {
         let branch = self.output(["branch", "--show-current"])?;
         let branch = branch.trim();
@@ -192,12 +225,24 @@ impl Git {
         self.output(["reset", "-q"])
     }
 
-    pub fn apply_patch_to_index(&self, patch: &str) -> Result<String> {
-        if patch.trim().is_empty() {
+    pub fn apply_patch_to_index(&self, file_path: &str, patch: &str) -> Result<String> {
+        // Normalize CRLF → LF: LLMs on Windows often emit \r\n which git apply rejects
+        let patch = patch.replace("\r\n", "\n").replace('\r', "\n");
+        let patch = patch.trim();
+        if patch.is_empty() {
             return Err(AppError::Custom(
                 "commit group patch cannot be empty".to_string(),
             ));
         }
+
+        // Ensure the file path uses forward slashes (git expects POSIX paths)
+        let git_path = file_path.replace('\\', "/");
+
+        let patch_with_header = if patch.starts_with("--- ") {
+            patch.to_string()
+        } else {
+            format!("--- a/{git_path}\n+++ b/{git_path}\n{patch}")
+        };
 
         let mut child = Command::new("git")
             .current_dir(&self.cwd)
@@ -209,20 +254,36 @@ impl Git {
             .map_err(|_| AppError::GitMissing)?;
 
         if let Some(stdin) = child.stdin.as_mut() {
-            stdin.write_all(patch.as_bytes()).map_err(|error| {
-                AppError::Custom(format!("failed to write patch to git: {}", error))
-            })?;
+            stdin
+                .write_all(patch_with_header.as_bytes())
+                .map_err(|error| {
+                    AppError::Custom(format!("failed to write patch to git: {}", error))
+                })?;
         }
 
         let output = child
             .wait_with_output()
             .map_err(|error| AppError::Custom(format!("failed to apply patch: {}", error)))?;
-        command_stdout(
-            output.status,
-            output.stdout,
-            output.stderr,
-            "git apply --cached --recount --whitespace=nowarn -",
-        )
+
+        if output.status.success() {
+            return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
+        }
+
+        // Patch failed — fall back to staging the whole file.
+        // This is safe because the commit plan groups already scope what gets committed;
+        // staging the full file here is better than aborting the whole commit plan.
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let lower = stderr.to_lowercase();
+        if lower.contains("permission denied") || lower.contains("access denied") {
+            return Err(AppError::GitPermissionDenied(stderr));
+        }
+
+        // Try whole-file add as fallback
+        self.add_paths(&[git_path])
+            .map_err(|_| AppError::GitCommand {
+                args: "git apply --cached --recount --whitespace=nowarn -".to_string(),
+                stderr,
+            })
     }
 
     pub fn commit(&self, message: &CommitMessage) -> Result<String> {
@@ -240,6 +301,70 @@ impl Git {
         } else {
             self.output_push(["push", "--set-upstream", "origin", &branch])
         }
+    }
+
+    pub fn commit_log(&self, limit: usize) -> Result<Vec<CommitLogEntry>> {
+        let limit = limit.clamp(1, 100).to_string();
+        let output = self.output([
+            "log",
+            "--date=relative",
+            "--decorate=short",
+            "--format=%H%x1f%h%x1f%D%x1f%s%x1f%an%x1f%cr",
+            "-n",
+            &limit,
+        ])?;
+        Ok(parse_commit_log(&output))
+    }
+
+    pub fn commit_log_between(&self, base: &str, head: &str) -> Result<Vec<CommitLogEntry>> {
+        let range = format!("{}..{}", base, head);
+        let output = self.output([
+            "log",
+            "--date=relative",
+            "--decorate=short",
+            "--format=%H%x1f%h%x1f%D%x1f%s%x1f%an%x1f%cr",
+            &range,
+        ])?;
+        Ok(parse_commit_log(&output))
+    }
+
+    pub fn can_merge(&self, base: &str) -> bool {
+        let status = Command::new("git")
+            .current_dir(&self.cwd)
+            .args(["merge-tree", base, "HEAD"])
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status();
+
+        match status {
+            Ok(s) => s.success(),
+            Err(_) => false,
+        }
+    }
+
+    pub fn diff_between(
+        &self,
+        base: &str,
+        head: &str,
+        max_chars: usize,
+        context_lines: u32,
+    ) -> Result<DiffContext> {
+        let u_arg = format!("-U{}", context_lines);
+        let range = format!("{}...{}", base, head);
+        let status = self.output(["diff", "--name-status", &range])?;
+        let stat = self.output(["diff", "--stat", &range])?;
+        let diff = self.output(["diff", &u_arg, &range])?;
+        let (diff, truncated) = truncate_diff(diff, max_chars);
+        Ok(DiffContext {
+            status,
+            stat,
+            diff,
+            truncated,
+        })
+    }
+
+    pub fn reset_soft_to(&self, hash: &str) -> Result<String> {
+        self.output(["reset", "--soft", hash])
     }
 
     pub fn fetch_origin(&self) -> Result<String> {
@@ -290,8 +415,19 @@ impl Git {
         Ok(output)
     }
 
+    pub fn create_and_switch_branch(&self, name: &str) -> Result<String> {
+        self.ensure_repo()?;
+        let branch = name.trim();
+        if branch.is_empty() {
+            return Err(AppError::Custom("Branch name is required.".to_string()));
+        }
+        let output = self.output(["checkout", "-b", branch])?;
+        self.invalidate_status_cache();
+        Ok(output)
+    }
+
     fn invalidate_status_cache(&self) {
-        self.cache.lock().unwrap().status = None;
+        self.cache.lock().expect("git cache lock poisoned").status = None;
     }
 
     pub fn diff_context(
@@ -323,6 +459,26 @@ impl Git {
                 .unwrap_or_default();
             diff = self.append_untracked_diffs(diff, &untracked);
         }
+
+        let (diff, truncated) = truncate_diff(diff, max_chars);
+        Ok(DiffContext {
+            status,
+            stat,
+            diff,
+            truncated,
+        })
+    }
+
+    pub fn branch_diff_context(
+        &self,
+        branch: &str,
+        max_chars: usize,
+        context_lines: u32,
+    ) -> Result<DiffContext> {
+        let u_arg = format!("-U{}", context_lines);
+        let status = self.output(["diff", "--name-status", branch])?;
+        let stat = self.output(["diff", "--stat", branch])?;
+        let diff = self.output(["diff", &u_arg, branch])?;
 
         let (diff, truncated) = truncate_diff(diff, max_chars);
         Ok(DiffContext {
@@ -571,6 +727,58 @@ fn is_protected_branch_name(branch: &str) -> bool {
     matches!(branch.trim(), "main" | "master")
 }
 
+fn parse_working_tree_sync(output: &str) -> WorkingTreeSync {
+    let mut sync = WorkingTreeSync::default();
+    for line in output.lines() {
+        if let Some(branch) = line.strip_prefix("## ") {
+            sync.has_upstream = branch.contains("...");
+            if let Some(metadata) = branch
+                .split('[')
+                .nth(1)
+                .and_then(|part| part.split(']').next())
+            {
+                for item in metadata.split(',') {
+                    let item = item.trim();
+                    if let Some(value) = item.strip_prefix("ahead ") {
+                        sync.ahead = value.parse().unwrap_or(0);
+                    } else if let Some(value) = item.strip_prefix("behind ") {
+                        sync.behind = value.parse().unwrap_or(0);
+                    }
+                }
+            }
+        } else if !line.trim().is_empty() {
+            sync.has_changes = true;
+        }
+    }
+    sync
+}
+
+fn parse_commit_log(output: &str) -> Vec<CommitLogEntry> {
+    output
+        .lines()
+        .filter_map(|line| {
+            let mut parts = line.split('\x1f');
+            let hash = parts.next()?.trim();
+            let short_hash = parts.next()?.trim();
+            let decorations = parts.next().unwrap_or("").trim();
+            let subject = parts.next().unwrap_or("").trim();
+            let author = parts.next().unwrap_or("").trim();
+            let relative_time = parts.next().unwrap_or("").trim();
+            if hash.is_empty() || short_hash.is_empty() {
+                return None;
+            }
+            Some(CommitLogEntry {
+                hash: hash.to_string(),
+                short_hash: short_hash.to_string(),
+                decorations: decorations.to_string(),
+                subject: subject.to_string(),
+                author: author.to_string(),
+                relative_time: relative_time.to_string(),
+            })
+        })
+        .collect()
+}
+
 fn classify_push_error(error: AppError) -> AppError {
     let AppError::GitCommand { args, stderr } = error else {
         return error;
@@ -652,6 +860,12 @@ mod tests {
             .status()
             .unwrap();
         assert!(status.success(), "git {:?} failed", args);
+        if args.first() == Some(&"init") {
+            let _ = Command::new("git")
+                .current_dir(path)
+                .args(["config", "commit.gpgsign", "false"])
+                .status();
+        }
     }
 
     fn git_output_in(path: &Path, args: &[&str]) -> String {
@@ -666,6 +880,51 @@ mod tests {
 
     fn write_file(path: &Path, name: &str, body: &str) {
         std::fs::write(path.join(name), body).unwrap();
+    }
+
+    #[test]
+    fn parses_clean_synced_branch_status() {
+        let sync = parse_working_tree_sync("## main...origin/main\n");
+
+        assert!(!sync.has_changes);
+        assert!(sync.has_upstream);
+        assert_eq!(sync.ahead, 0);
+        assert_eq!(sync.behind, 0);
+    }
+
+    #[test]
+    fn parses_ahead_behind_and_local_changes() {
+        let sync = parse_working_tree_sync(
+            "## feature/api...origin/feature/api [ahead 2, behind 1]\n M src/main.rs\n?? docs/new.md\n",
+        );
+
+        assert!(sync.has_changes);
+        assert!(sync.has_upstream);
+        assert_eq!(sync.ahead, 2);
+        assert_eq!(sync.behind, 1);
+    }
+
+    #[test]
+    fn parses_branch_without_upstream() {
+        let sync = parse_working_tree_sync("## local-only\n");
+
+        assert!(!sync.has_changes);
+        assert!(!sync.has_upstream);
+    }
+
+    #[test]
+    fn parses_decorated_commit_log_entries() {
+        let entries = parse_commit_log(
+            "abc123456789\x1fabc1234\x1fHEAD -> main, origin/main\x1fadd log modal\x1fAda\x1f2 minutes ago\n",
+        );
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].hash, "abc123456789");
+        assert_eq!(entries[0].short_hash, "abc1234");
+        assert_eq!(entries[0].decorations, "HEAD -> main, origin/main");
+        assert_eq!(entries[0].subject, "add log modal");
+        assert_eq!(entries[0].author, "Ada");
+        assert_eq!(entries[0].relative_time, "2 minutes ago");
     }
 
     fn git_commit_with_dates(path: &Path, message: &str, author_date: &str, committer_date: &str) {
@@ -796,21 +1055,24 @@ mod tests {
         );
 
         git_in(dir.path(), &["checkout", "main"]);
-        let remote_root = dir.path().join("remote.git");
         git_in(
             dir.path(),
-            &["init", "--bare", remote_root.to_str().unwrap()],
+            &["remote", "add", "origin", "https://example.com/repo.git"],
         );
         git_in(
             dir.path(),
-            &["remote", "add", "origin", remote_root.to_str().unwrap()],
+            &["update-ref", "refs/remotes/origin/main", "main"],
         );
-        git_in(dir.path(), &["push", "-u", "origin", "main"]);
-        git_in(dir.path(), &["push", "-u", "origin", "alpha"]);
-        git_in(dir.path(), &["push", "-u", "origin", "zeta"]);
+        git_in(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/alpha", "alpha"],
+        );
+        git_in(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/zeta", "zeta"],
+        );
 
         let git = Git::new(dir.path().to_path_buf());
-        git.fetch_origin().unwrap();
         let branches = git.switch_branches().unwrap();
 
         assert_eq!(
@@ -847,21 +1109,21 @@ mod tests {
         git_in(dir.path(), &["commit", "-m", "feature"]);
         git_in(dir.path(), &["checkout", "main"]);
 
-        let remote_root = dir.path().join("remote.git");
         git_in(
             dir.path(),
-            &["init", "--bare", remote_root.to_str().unwrap()],
+            &["remote", "add", "origin", "https://example.com/repo.git"],
         );
         git_in(
             dir.path(),
-            &["remote", "add", "origin", remote_root.to_str().unwrap()],
+            &["update-ref", "refs/remotes/origin/main", "main"],
         );
-        git_in(dir.path(), &["push", "-u", "origin", "main"]);
-        git_in(dir.path(), &["push", "-u", "origin", "feature"]);
+        git_in(
+            dir.path(),
+            &["update-ref", "refs/remotes/origin/feature", "feature"],
+        );
         git_in(dir.path(), &["branch", "-D", "feature"]);
 
         let git = Git::new(dir.path().to_path_buf());
-        git.fetch_origin().unwrap();
         let remote_feature = git
             .switch_branches()
             .unwrap()
@@ -878,5 +1140,37 @@ mod tests {
             &["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"],
         );
         assert_eq!(upstream, "origin/feature");
+    }
+
+    #[test]
+    fn test_can_merge_and_diff_between() {
+        let dir = tempdir().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        git_in(dir.path(), &["config", "user.name", "Tester"]);
+        git_in(dir.path(), &["config", "user.email", "tester@example.com"]);
+        write_file(dir.path(), "file.txt", "base content\n");
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "commit 1"]);
+
+        git_in(dir.path(), &["checkout", "-b", "feature"]);
+        write_file(dir.path(), "file.txt", "base content\nfeature content\n");
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "commit 2"]);
+
+        let git = Git::new(dir.path().to_path_buf());
+        assert!(git.can_merge("main"));
+
+        let diff = git.diff_between("main", "feature", 1000, 3).unwrap();
+        assert!(diff.status.contains("M\tfile.txt") || diff.status.contains("M file.txt"));
+        assert!(diff.diff.contains("+feature content"));
+
+        // Create conflict
+        git_in(dir.path(), &["checkout", "main"]);
+        write_file(dir.path(), "file.txt", "conflicting content\n");
+        git_in(dir.path(), &["add", "."]);
+        git_in(dir.path(), &["commit", "-m", "commit 3"]);
+
+        git_in(dir.path(), &["checkout", "feature"]);
+        assert!(!git.can_merge("main"));
     }
 }

@@ -71,6 +71,7 @@ pub fn draw(frame: &mut Frame<'_>, app: &TuiApp) {
     }
 }
 
+
 fn render_history(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     let colors = palette(app.core.config.theme);
     let available_width = area.width as usize;
@@ -86,7 +87,10 @@ fn render_history(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
     for entry in &app.history {
         let (role_label, pcolor) = match entry.role {
             ChatRole::User => ("> You", colors.user),
-            ChatRole::Assistant => ("Autopilot", colors.assistant),
+            ChatRole::Assistant => match app.execution_mode {
+                crate::ui::state::ExecutionMode::Scout => ("Scout", colors.assistant),
+                crate::ui::state::ExecutionMode::Autopilot => ("Autopilot", colors.assistant),
+            },
             ChatRole::System => ("System", colors.system),
             ChatRole::Error => ("Error", colors.warning),
         };
@@ -118,44 +122,39 @@ fn render_history(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
                 let text_style = Style::default().fg(text_color).bg(bg_color);
 
                 all_lines.push(Line::styled(
-                    format!("  ┌{}┐", "─".repeat(box_width.saturating_sub(2))),
+                    format!("  ┌{}┐", "─".repeat(box_width.saturating_sub(4))),
                     box_style,
                 ));
 
                 for line in display_message_lines(entry) {
                     if line.trim().is_empty() {
-                        all_lines.push(Line::styled(
-                            format!("  │ {} │", "─".repeat(content_width)),
-                            box_style,
-                        ));
+                        let padded = " ".repeat(content_width);
+                        all_lines.push(Line::from(vec![
+                            Span::styled("  │ ", box_style),
+                            Span::styled(padded, text_style),
+                            Span::styled(" │", box_style),
+                        ]));
                     } else {
-                        let chars = line.chars().collect::<Vec<_>>();
-                        if chars.is_empty() {
-                            let padded = " ".repeat(content_width);
-                            all_lines.push(Line::from(vec![
-                                Span::styled("  │ ", box_style),
-                                Span::styled(padded, text_style),
-                                Span::styled(" │", box_style),
-                            ]));
+                        let tokens = if matches!(entry.role, ChatRole::Assistant) {
+                            tokenize_diff_line(&line, &colors, text_style)
                         } else {
-                            let mut start = 0;
-                            while start < chars.len() {
-                                let end = (start + content_width).min(chars.len());
-                                let chunk: String = chars[start..end].iter().collect();
-                                let padded = format!("{:<width$}", chunk, width = content_width);
-                                all_lines.push(Line::from(vec![
-                                    Span::styled("  │ ", box_style),
-                                    Span::styled(padded, text_style),
-                                    Span::styled(" │", box_style),
-                                ]));
-                                start = end;
+                            vec![(line.clone(), text_style)]
+                        };
+
+                        let wrapped_lines = wrap_spans(tokens, content_width);
+                        for wrapped_line_spans in wrapped_lines {
+                            let mut line_spans = vec![Span::styled("  │ ", box_style)];
+                            for s in wrapped_line_spans {
+                                line_spans.push(Span::styled(s.content.into_owned(), s.style.bg(bg_color)));
                             }
+                            line_spans.push(Span::styled(" │", box_style));
+                            all_lines.push(Line::from(line_spans));
                         }
                     }
                 }
 
                 all_lines.push(Line::styled(
-                    format!("  └{}┘", "─".repeat(box_width.saturating_sub(2))),
+                    format!("  └{}┘", "─".repeat(box_width.saturating_sub(4))),
                     box_style,
                 ));
             }
@@ -268,6 +267,8 @@ fn clean_markdown_line(raw: &str) -> String {
         line = format!("{}{}", " ".repeat(leading_spaces), rest);
     } else if let Some(rest) = trimmed_start.strip_prefix('>') {
         line = format!("{}{}", " ".repeat(leading_spaces), rest.trim_start());
+    } else if (trimmed_start.starts_with("+ ") || trimmed_start.starts_with("- ")) && leading_spaces > 0 {
+        // Do not convert structured +/- detail lines with indentation (like status details)
     } else if let Some(rest) = trimmed_start
         .strip_prefix("- ")
         .or_else(|| trimmed_start.strip_prefix("* "))
@@ -278,8 +279,237 @@ fn clean_markdown_line(raw: &str) -> String {
     line = replace_markdown_links(&line);
     line.replace("**", "")
         .replace("__", "")
-        .replace('`', "")
-        .replace('*', "")
+        .replace(['`', '*'], "")
+}
+
+
+fn tokenize_semantic_description(description: &str, _colors: &Palette, text_style: Style) -> Vec<(String, Style)> {
+    vec![(description.to_string(), text_style)]
+}
+
+fn tokenize_file_stats(text: &str, colors: &Palette, text_style: Style) -> Vec<(String, Style)> {
+    let mut tokens = Vec::new();
+    let mut last_idx = 0;
+    
+    while let Some(start_offset) = text[last_idx..].find("(+") {
+        let start_idx = last_idx + start_offset;
+        if let Some(end_offset) = text[start_idx..].find(')') {
+            let end_idx = start_idx + end_offset;
+            let inner = &text[start_idx + 1..end_idx];
+            
+            if let Some(minus_offset) = inner.find('-') {
+                let minus_idx = start_idx + 1 + minus_offset;
+                let plus_part = &text[start_idx + 1..minus_idx];
+                let minus_part = &text[minus_idx..end_idx];
+                
+                let plus_num_trimmed = plus_part.trim_end_matches(|c: char| c == ',' || c.is_whitespace());
+                
+                if plus_num_trimmed.starts_with('+') && minus_part.starts_with('-') {
+                    let prefix = &text[last_idx..start_idx];
+                    if !prefix.is_empty() {
+                        tokens.push((prefix.to_string(), text_style));
+                    }
+                    
+                    tokens.push(("(".to_string(), text_style));
+                    tokens.push((plus_num_trimmed.to_string(), Style::default().fg(colors.success)));
+                    
+                    let separator = &plus_part[plus_num_trimmed.len()..];
+                    if !separator.is_empty() {
+                        tokens.push((separator.to_string(), text_style));
+                    }
+                    
+                    tokens.push((minus_part.to_string(), Style::default().fg(colors.warning)));
+                    tokens.push((")".to_string(), text_style));
+                    
+                    last_idx = end_idx + 1;
+                    continue;
+                }
+            }
+        }
+        break;
+    }
+    
+    if last_idx < text.len() {
+        tokens.push((text[last_idx..].to_string(), text_style));
+    }
+    
+    tokens
+}
+
+fn tokenize_description_part(text: &str, colors: &Palette, text_style: Style) -> Vec<(String, Style)> {
+    if let Some(pos) = text.find(" - ") {
+        let lhs = &text[..pos + 3];
+        let rhs = &text[pos + 3..];
+        
+        let mut tokens = tokenize_file_stats(lhs, colors, text_style);
+        tokens.extend(tokenize_semantic_description(rhs, colors, text_style));
+        tokens
+    } else {
+        tokenize_file_stats(text, colors, text_style)
+    }
+}
+
+fn tokenize_diff_line(line: &str, colors: &Palette, text_style: Style) -> Vec<(String, Style)> {
+    let trimmed = line.trim_start();
+
+    if trimmed.starts_with("+++") || trimmed.starts_with("---") {
+        return vec![(line.to_string(), Style::default().fg(colors.muted))];
+    }
+
+    if trimmed.starts_with("- ") {
+        let rest = &trimmed[2..];
+        let rest_lower = rest.to_lowercase();
+        if rest_lower.starts_with("agregado") || rest_lower.starts_with("added") || rest_lower.starts_with("copiado") || rest_lower.starts_with("copied") {
+            return vec![(line.to_string(), Style::default().fg(colors.success))];
+        }
+        if rest_lower.starts_with("eliminado") || rest_lower.starts_with("deleted") || rest_lower.starts_with("conflict") || rest_lower.starts_with("conflicto") {
+            return vec![(line.to_string(), Style::default().fg(colors.warning))];
+        }
+        if rest_lower.starts_with("modificado") || rest_lower.starts_with("modified") ||
+           rest_lower.starts_with("renombrado") || rest_lower.starts_with("renamed") ||
+           rest_lower.starts_with("ignorado") || rest_lower.starts_with("ignored") ||
+           rest_lower.starts_with("sin tracking") || rest_lower.starts_with("untracked") ||
+           rest_lower.starts_with("cambiado") || rest_lower.starts_with("changed") {
+            return vec![(line.to_string(), text_style)];
+        }
+    }
+
+    if trimmed.starts_with('+') {
+        return vec![(line.to_string(), Style::default().fg(colors.success))];
+    }
+    if trimmed.starts_with('-') {
+        return vec![(line.to_string(), Style::default().fg(colors.warning))];
+    }
+    if trimmed.starts_with("@@") && trimmed.ends_with("@@") {
+        return vec![(line.to_string(), Style::default().fg(colors.info))];
+    }
+
+    let mut tokens = Vec::new();
+    let mut current_byte = 0;
+    let bytes_len = line.len();
+
+    while current_byte < bytes_len {
+        let rest = &line[current_byte..];
+        if let Some(first_rel) = rest.find("@@") {
+            let first = current_byte + first_rel;
+            if let Some(second_rel) = rest[first_rel + 2..].find("@@") {
+                let second = first + 2 + second_rel;
+
+                if first > current_byte {
+                    let before_text = &line[current_byte..first];
+                    if !trimmed.starts_with('•') {
+                        tokens.extend(tokenize_semantic_description(before_text, colors, text_style));
+                    } else {
+                        tokens.extend(tokenize_description_part(before_text, colors, text_style));
+                    }
+                }
+
+                let hunk_text = &line[first..second + 2];
+                tokens.push((hunk_text.to_string(), Style::default().fg(colors.info)));
+
+                current_byte = second + 2;
+                continue;
+            }
+        }
+
+        let remaining_text = &line[current_byte..];
+        if !trimmed.starts_with('•') {
+            tokens.extend(tokenize_semantic_description(remaining_text, colors, text_style));
+        } else {
+            tokens.extend(tokenize_description_part(remaining_text, colors, text_style));
+        }
+        break;
+    }
+
+    tokens
+}
+
+fn wrap_spans(spans: Vec<(String, Style)>, content_width: usize) -> Vec<Vec<Span<'static>>> {
+    let mut tokens = Vec::new();
+    for (text, style) in spans {
+        let mut current = String::new();
+        let mut current_is_ws = None;
+        for ch in text.chars() {
+            let is_ws = ch.is_whitespace();
+            if let Some(prev_is_ws) = current_is_ws {
+                if prev_is_ws != is_ws {
+                    tokens.push((current, style, prev_is_ws));
+                    current = String::new();
+                }
+            }
+            current_is_ws = Some(is_ws);
+            current.push(ch);
+        }
+        if !current.is_empty() {
+            tokens.push((current, style, current_is_ws.unwrap_or(false)));
+        }
+    }
+
+    let mut lines = Vec::new();
+    let mut current_line = Vec::new();
+    let mut current_len = 0;
+
+    let push_and_pad = |lines: &mut Vec<Vec<Span<'static>>>, mut line: Vec<Span<'static>>, len: usize| {
+        let padding = content_width.saturating_sub(len);
+        if padding > 0 {
+            line.push(Span::styled(" ".repeat(padding), Style::default()));
+        }
+        lines.push(line);
+    };
+
+    for (text, style, is_ws) in tokens {
+        let chars: Vec<char> = text.chars().collect();
+        let token_len = chars.len();
+
+        if current_len + token_len <= content_width {
+            current_line.push(Span::styled(text, style));
+            current_len += token_len;
+        } else {
+            if is_ws {
+                let line_to_push = std::mem::take(&mut current_line);
+                let len_to_push = current_len;
+                current_len = 0;
+                push_and_pad(&mut lines, line_to_push, len_to_push);
+            } else {
+                if token_len > content_width {
+                    let mut start = 0;
+                    while start < chars.len() {
+                        let remaining = content_width.saturating_sub(current_len);
+                        if remaining == 0 {
+                            let line_to_push = std::mem::take(&mut current_line);
+                            let len_to_push = current_len;
+                            current_len = 0;
+                            push_and_pad(&mut lines, line_to_push, len_to_push);
+                            continue;
+                        }
+                        let take = (chars.len() - start).min(remaining);
+                        let chunk: String = chars[start..start + take].iter().collect();
+                        current_line.push(Span::styled(chunk, style));
+                        current_len += take;
+                        start += take;
+                        if current_len == content_width {
+                            let line_to_push = std::mem::take(&mut current_line);
+                            let len_to_push = current_len;
+                            current_len = 0;
+                            push_and_pad(&mut lines, line_to_push, len_to_push);
+                        }
+                    }
+                } else {
+                    let line_to_push = std::mem::take(&mut current_line);
+                    let len_to_push = current_len;
+                    push_and_pad(&mut lines, line_to_push, len_to_push);
+                    current_line = vec![Span::styled(text, style)];
+                    current_len = token_len;
+                }
+            }
+        }
+    }
+
+    if !current_line.is_empty() || lines.is_empty() {
+        push_and_pad(&mut lines, current_line, current_len);
+    }
+
+    lines
 }
 
 fn replace_markdown_links(line: &str) -> String {
@@ -420,8 +650,8 @@ fn render_input(frame: &mut Frame<'_>, app: &TuiApp, area: Rect) {
         }
     } else if app.input.is_empty() {
         let placeholder = match lang.trim() {
-            "spanish" | "español" | "espanol" => "Pregunta lo que sea o usa / para comandos",
-            _ => "Ask anything or use / for commands",
+            "spanish" | "español" | "espanol" => "Escribe / para usar los comandos del sistema",
+            _ => "Type / to use system commands",
         };
         line_spans.push(Span::styled(placeholder, Style::default().fg(colors.muted)));
     } else {
@@ -492,7 +722,8 @@ fn responsive_status_lines(
         "spanish" | "español" | "espanol" => "Contexto",
         _ => "Context",
     };
-    let context_item = if let Some(usage) = app.last_context_usage {
+    let show_context_usage = app.core.config.provider == crate::domain::LlmProviderKind::Ollama;
+    let context_item = if show_context_usage && let Some(usage) = app.last_context_usage {
         let percent = usage.percent().unwrap_or(0);
         let context_color = if percent >= 85 {
             colors.warning
@@ -536,7 +767,8 @@ fn responsive_status_lines(
         compact,
     ));
     items.extend(degraded_capability_items(app, lang_str, colors));
-    if let Some(usage) = app.last_context_usage
+    if show_context_usage
+        && let Some(usage) = app.last_context_usage
         && usage.truncated
     {
         let truncated = match lang_str {
@@ -798,10 +1030,8 @@ fn provider_status_span(app: &TuiApp, colors: Palette, compact: bool) -> Span<'s
             };
             let label = if compact {
                 "Ollama".to_string()
-            } else if is_spanish {
-                format!("Proveedor Ollama{}", vram_info)
             } else {
-                format!("Ollama Provider{}", vram_info)
+                format!("Ollama{}", vram_info)
             };
             Span::styled(
                 format!(" {} ", label),
@@ -1033,7 +1263,10 @@ fn degraded_capability_items(
                 .add_modifier(Modifier::BOLD),
         )),
         DependencyState::NotConfigured => items.push(capability_chip(
-            " github auth ",
+            match lang {
+                "spanish" | "español" | "espanol" => " PR requiere login ",
+                _ => " PR auth needed ",
+            },
             Style::default()
                 .fg(Color::Rgb(15, 23, 42))
                 .bg(Color::Rgb(250, 204, 21))
@@ -1259,6 +1492,9 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
     let colors = palette(app.core.config.theme);
     let area = match modal {
         Modal::OnboardingWizard { .. } => centered_rect(82, 78, frame.area()),
+        Modal::PrDraft { .. }
+        | Modal::CommitPlanReview { .. }
+        | Modal::CommitReview { .. } => centered_rect(85, 80, frame.area()),
         _ => centered_rect(68, 60, frame.area()),
     };
     if area.width < 10 || area.height < 5 {
@@ -1470,14 +1706,106 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
                 &mut state,
             );
         }
+        Modal::PrBaseBranch {
+            current_branch,
+            branches,
+            selected,
+        } => {
+            let is_spanish = is_spanish_language(&lang);
+            let title = if is_spanish {
+                "Seleccionar rama base del PR \u{2502} \u{2191}\u{2195} Enter selecc  Esc cerrar"
+            } else {
+                "Select PR base branch \u{2502} \u{2191}\u{2195} Enter select  Esc close"
+            };
+            let header = if is_spanish {
+                format!(
+                    "Creando PR desde \u{201c}{}\u{201d}\nSeleccion\u{00e1} la rama destino donde se mergear\u{00e1}n tus cambios.",
+                    current_branch
+                )
+            } else {
+                format!(
+                    "Creating PR from \u{201c}{}\u{201d}\nSelect the target branch where your changes will be merged.",
+                    current_branch
+                )
+            };
+            let rows: Vec<ListItem> = branches
+                .iter()
+                .enumerate()
+                .map(|(index, branch)| {
+                    let is_selected = index == *selected;
+                    let marker = if is_selected { ">" } else { " " };
+                    let style = if is_selected {
+                        Style::default().fg(colors.accent).bold()
+                    } else {
+                        Style::default().fg(colors.text)
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(marker, style),
+                        Span::raw(" "),
+                        Span::styled(branch.clone(), style),
+                    ]))
+                })
+                .collect();
+            let block = modal_block_with_border(title, colors, colors.accent);
+            frame.render_widget(block.clone(), area);
+            let inner = block.inner(area);
+            let padded = inner.inner(ratatui::layout::Margin {
+                horizontal: 2,
+                vertical: 1,
+            });
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                ])
+                .split(padded);
+            frame.render_widget(
+                Paragraph::new(header)
+                    .wrap(Wrap { trim: true })
+                    .style(Style::default().fg(colors.accent).bold()),
+                layout[0],
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "\u{2500}".repeat(layout[1].width as usize),
+                    Style::default().fg(colors.border),
+                )),
+                layout[1],
+            );
+            let mut state = ListState::default();
+            state.select(Some(*selected));
+            frame.render_stateful_widget(
+                List::new(rows).block(Block::default().borders(Borders::NONE)),
+                layout[2],
+                &mut state,
+            );
+        }
         Modal::Confirm {
             title,
             message,
             selected,
-            ..
+            kind,
         } => {
-            let options = match lang.trim() {
-                "spanish" | "español" | "espanol" => ["Sí", "No"],
+            let border_color = if matches!(kind, crate::ui::state::ConfirmKind::ResetConfiguration)
+            {
+                colors.system
+            } else {
+                colors.border
+            };
+            let outer = modal_block_with_border(title, colors, border_color);
+            frame.render_widget(outer.clone(), area);
+            let inner_area = outer.inner(area);
+            let options = match (lang.trim(), kind) {
+                (
+                    "spanish" | "español" | "espanol",
+                    crate::ui::state::ConfirmKind::ResetConfiguration,
+                ) => ["Resetear configuración", "Cancelar"],
+                (_, crate::ui::state::ConfirmKind::ResetConfiguration) => {
+                    ["Reset settings", "Cancel"]
+                }
+                ("spanish" | "español" | "espanol", _) => ["Sí", "No"],
                 _ => ["Yes", "No"],
             };
             let rows: Vec<ListItem> = options
@@ -1503,15 +1831,29 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
             let inner = Layout::default()
                 .direction(Direction::Vertical)
                 .constraints([
-                    Constraint::Length((msg_lines + 2).min(area.height.saturating_sub(4))),
+                    Constraint::Length((msg_lines + 4).min(inner_area.height.saturating_sub(4))),
                     Constraint::Length(rows.len() as u16 + 2),
                 ])
-                .split(area);
+                .split(inner_area);
 
+            let question_label = match lang.trim() {
+                "spanish" | "español" | "espanol" => "Pregunta",
+                _ => "Question",
+            };
             frame.render_widget(
-                Paragraph::new(message.as_str())
-                    .wrap(Wrap { trim: true })
-                    .style(Style::default().bg(colors.modal_bg)),
+                Paragraph::new(vec![
+                    Line::from(Span::styled(
+                        question_label,
+                        Style::default().fg(colors.accent).bold(),
+                    )),
+                    Line::from(""),
+                    Line::from(Span::styled(
+                        message.clone(),
+                        Style::default().fg(colors.text).bold(),
+                    )),
+                ])
+                .wrap(Wrap { trim: true })
+                .style(Style::default().bg(colors.modal_bg)),
                 inner[0],
             );
             let hint = match lang.trim() {
@@ -1519,10 +1861,12 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
                 _ => "select  Esc cancel",
             };
             frame.render_widget(
-                List::new(rows).block(modal_block(
-                    &format!("{} \u{2502} \u{2191}\u{2195} Enter {}", title, hint),
-                    colors,
-                )),
+                List::new(rows)
+                    .style(Style::default().bg(colors.modal_bg))
+                    .block(modal_block(
+                        &format!("\u{2191}\u{2195} Enter {}", hint),
+                        colors,
+                    )),
                 inner[1],
             );
         }
@@ -1548,7 +1892,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
             if !branches.remote.is_empty() {
                 rows.push(ListItem::new(Line::from(vec![Span::styled(
                     origin_header,
-                    Style::default().fg(colors.warning).bold(),
+                    Style::default().fg(colors.accent).bold(),
                 )])));
                 for branch in &branches.remote {
                     if item_index == *selected {
@@ -1567,7 +1911,7 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
             if !branches.local.is_empty() {
                 rows.push(ListItem::new(Line::from(vec![Span::styled(
                     local_header,
-                    Style::default().fg(colors.warning).bold(),
+                    Style::default().fg(colors.accent).bold(),
                 )])));
                 for branch in &branches.local {
                     if item_index == *selected {
@@ -1596,6 +1940,341 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
                 )),
                 area,
                 &mut state,
+            );
+        }
+        Modal::BranchDiff { branches, selected } => {
+            let current_branch = app.core.status().branch.clone();
+
+            let title = match lang.trim() {
+                "spanish" | "español" | "espanol" => "Comparar con rama",
+                _ => "Compare with branch",
+            };
+
+            let outer_block = modal_block(title, colors);
+            frame.render_widget(outer_block.clone(), area);
+            let inner_area = outer_block.inner(area);
+
+            // Split the inner area:
+            // 1. Top Panel (height 4): Current branch + instructions
+            // 2. Separator line (height 1)
+            // 3. Branches List (remaining height)
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(4),
+                    Constraint::Length(1),
+                    Constraint::Min(3),
+                ])
+                .split(inner_area);
+
+            // 1. Top Panel Content
+            let top_text = match lang.trim() {
+                "spanish" | "español" | "espanol" => vec![
+                    Line::from(vec![
+                        Span::raw("Rama actual: "),
+                        Span::styled(format!(" {} ", current_branch), Style::default().fg(colors.success).bg(colors.status_bg).bold()),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled("Selecciona la rama con la que deseas comparar:", Style::default().fg(colors.text).bold())),
+                    Line::from(Span::styled("Esto comparará tu estado actual contra la rama seleccionada con IA.", Style::default().fg(colors.muted))),
+                ],
+                _ => vec![
+                    Line::from(vec![
+                        Span::raw("Current branch: "),
+                        Span::styled(format!(" {} ", current_branch), Style::default().fg(colors.success).bg(colors.status_bg).bold()),
+                    ]),
+                    Line::from(""),
+                    Line::from(Span::styled("Select the branch to compare against:", Style::default().fg(colors.text).bold())),
+                    Line::from(Span::styled("This will compare your current state with the selected branch using AI.", Style::default().fg(colors.muted))),
+                ],
+            };
+            frame.render_widget(Paragraph::new(top_text), chunks[0]);
+
+            // 2. Separator Line
+            let sep_line = Paragraph::new(Span::styled(
+                "─".repeat(inner_area.width as usize),
+                Style::default().fg(colors.border),
+            ));
+            frame.render_widget(sep_line, chunks[1]);
+
+            // 3. Branches List Panel
+            let origin_header = "origin";
+            let local_header = match lang.trim() {
+                "spanish" | "español" | "espanol" => "local",
+                _ => "local",
+            };
+            let current_suffix = match lang.trim() {
+                "spanish" | "español" | "espanol" => " actual",
+                _ => " current",
+            };
+
+            let mut rows = Vec::new();
+            let mut selected_row = None;
+            let mut item_index = 0usize;
+
+            if !branches.remote.is_empty() {
+                rows.push(ListItem::new(Line::from(vec![Span::styled(
+                    origin_header,
+                    Style::default().fg(colors.accent).bold(),
+                )])));
+                for branch in &branches.remote {
+                    if item_index == *selected {
+                        selected_row = Some(rows.len());
+                    }
+                    rows.push(branch_switch_item(
+                        branch,
+                        item_index == *selected,
+                        current_suffix,
+                        colors,
+                    ));
+                    item_index += 1;
+                }
+            }
+
+            if !branches.local.is_empty() {
+                rows.push(ListItem::new(Line::from(vec![Span::styled(
+                    local_header,
+                    Style::default().fg(colors.accent).bold(),
+                )])));
+                for branch in &branches.local {
+                    if item_index == *selected {
+                        selected_row = Some(rows.len());
+                    }
+                    rows.push(branch_switch_item(
+                        branch,
+                        item_index == *selected,
+                        current_suffix,
+                        colors,
+                    ));
+                    item_index += 1;
+                }
+            }
+
+            let hint = match lang.trim() {
+                "spanish" | "español" | "espanol" => "selecc  Esc cerrar",
+                _ => "select  Esc close",
+            };
+            let mut state = ListState::default();
+            state.select(selected_row);
+            
+            frame.render_stateful_widget(
+                List::new(rows).block(Block::default().title(format!(" ↑↓ Enter {}", hint)).title_alignment(ratatui::layout::Alignment::Right).title_style(Style::default().fg(colors.muted))),
+                chunks[2],
+                &mut state,
+            );
+        }
+        Modal::CommitLog {
+            entries,
+            selected,
+            action,
+            scroll,
+        } => {
+            let is_spanish = matches!(lang.trim(), "spanish" | "español" | "espanol");
+            let title = if is_spanish {
+                "Historial Git"
+            } else {
+                "Git history"
+            };
+            let hint = if is_spanish {
+                "↑↓ commit  Tab acción  Enter confirmar  Esc cerrar"
+            } else {
+                "↑↓ commit  Tab action  Enter confirm  Esc close"
+            };
+            let block_title = format!("{title} | {hint}");
+            let block = modal_block(&block_title, colors);
+            frame.render_widget(block.clone(), area);
+            let inner = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(8), Constraint::Length(3)])
+                .split(block.inner(area));
+            let visible = inner[0].height.saturating_sub(1).max(1) as usize;
+            let start = (*scroll).min(entries.len().saturating_sub(1));
+            let rows = entries
+                .iter()
+                .enumerate()
+                .skip(start)
+                .take(visible)
+                .map(|(index, entry)| {
+                    let is_selected = index == *selected;
+                    let marker = if is_selected { ">" } else { " " };
+                    let decorations = if entry.decorations.is_empty() {
+                        String::new()
+                    } else {
+                        format!(" [{}]", entry.decorations)
+                    };
+                    let style = if is_selected {
+                        Style::default().fg(colors.text).bg(colors.info).bold()
+                    } else {
+                        Style::default().fg(colors.text).bg(colors.modal_bg)
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(marker, style),
+                        Span::raw(" "),
+                        Span::styled(entry.short_hash.clone(), style.fg(colors.accent)),
+                        Span::styled(decorations, style.fg(colors.warning)),
+                        Span::raw(" "),
+                        Span::styled(entry.subject.clone(), style),
+                        Span::styled(
+                            format!("  {} · {}", entry.author, entry.relative_time),
+                            style.fg(colors.muted),
+                        ),
+                    ]))
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(
+                List::new(rows).style(Style::default().bg(colors.modal_bg)),
+                inner[0],
+            );
+            let actions = if is_spanish {
+                ["Reset soft hasta este commit", "Cerrar"]
+            } else {
+                ["Soft reset to this commit", "Close"]
+            };
+            let action_line = actions
+                .iter()
+                .enumerate()
+                .flat_map(|(index, label)| {
+                    let style = if index == *action {
+                        Style::default().fg(colors.text).bg(colors.info).bold()
+                    } else {
+                        Style::default().fg(colors.muted).bg(colors.modal_bg)
+                    };
+                    [Span::styled(format!(" {} ", label), style), Span::raw("  ")]
+                })
+                .collect::<Vec<_>>();
+            frame.render_widget(
+                Paragraph::new(Line::from(action_line))
+                    .style(Style::default().bg(colors.modal_bg))
+                    .wrap(Wrap { trim: true }),
+                inner[1],
+            );
+        }
+        Modal::ProtectedBranchCommit {
+            branch,
+            branches,
+            selected,
+            new_branch,
+            editing_new_branch,
+        } => {
+            let is_spanish = matches!(lang.trim(), "spanish" | "español" | "espanol");
+            let title = if is_spanish {
+                "Rama protegida"
+            } else {
+                "Protected branch"
+            };
+            let warning_bg = Color::Rgb(254, 226, 226);
+            let warning_fg = Color::Rgb(127, 29, 29);
+            let warning_border = Color::Rgb(248, 113, 113);
+            let available = branches.total_count();
+            let actions = [
+                if is_spanish {
+                    format!("Cambiar de rama ({available} disponibles)")
+                } else {
+                    format!("Switch branch ({available} available)")
+                },
+                if is_spanish {
+                    "Crear rama nueva".to_string()
+                } else {
+                    "Create new branch".to_string()
+                },
+                if is_spanish {
+                    "Continuar en esta rama".to_string()
+                } else {
+                    "Continue on this branch".to_string()
+                },
+            ];
+            let branch_value = if new_branch.is_empty() {
+                if is_spanish {
+                    "feature/nueva-rama"
+                } else {
+                    "feature/new-branch"
+                }
+            } else {
+                new_branch.as_str()
+            };
+            let branch_style = if *editing_new_branch {
+                Style::default()
+                    .fg(warning_fg)
+                    .bg(Color::Rgb(255, 245, 245))
+                    .bold()
+            } else {
+                Style::default().fg(warning_fg).bg(warning_bg)
+            };
+            let rows = actions
+                .iter()
+                .enumerate()
+                .map(|(index, action)| {
+                    let is_selected = index == *selected;
+                    let marker = if is_selected { ">" } else { " " };
+                    let style = if is_selected {
+                        Style::default().fg(warning_fg).bg(warning_bg).bold()
+                    } else {
+                        Style::default().fg(warning_fg).bg(warning_bg)
+                    };
+                    if index == 1 {
+                        ListItem::new(Line::from(vec![
+                            Span::styled(marker, style),
+                            Span::raw(" "),
+                            Span::styled(action.clone(), style),
+                            Span::raw("  "),
+                            Span::styled(branch_value.to_string(), branch_style),
+                        ]))
+                    } else {
+                        ListItem::new(Line::from(vec![
+                            Span::styled(marker, style),
+                            Span::raw(" "),
+                            Span::styled(action.clone(), style),
+                        ]))
+                    }
+                })
+                .collect::<Vec<_>>();
+            let message = if is_spanish {
+                format!(
+                    "Estás en `{branch}`. Para evitar commits directos en main/master, cambia o crea una rama y el plan de commits se ejecuta automáticamente."
+                )
+            } else {
+                format!(
+                    "You are on `{branch}`. To avoid direct commits on main/master, switch or create a branch and the commit plan will start automatically."
+                )
+            };
+            let esc_hint = if *editing_new_branch {
+                if is_spanish { "Esc volver" } else { "Esc back" }
+            } else if is_spanish {
+                "Esc cancelar"
+            } else {
+                "Esc cancel"
+            };
+            let hint = if is_spanish {
+                format!("↑↓ acción  Tab escribir rama  Enter confirmar  {esc_hint}")
+            } else {
+                format!("↑↓ action  Tab edit branch  Enter confirm  {esc_hint}")
+            };
+            let block = Block::default()
+                .title(format!("{title} | {hint}"))
+                .title_alignment(ratatui::layout::Alignment::Center)
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(warning_border))
+                .style(Style::default().fg(warning_fg).bg(warning_bg));
+            frame.render_widget(block.clone(), area);
+            let inner = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Length(4), Constraint::Min(4)])
+                .split(block.inner(area));
+            frame.render_widget(
+                Paragraph::new(message)
+                    .wrap(Wrap { trim: true })
+                    .style(Style::default().fg(warning_fg).bg(warning_bg).bold()),
+                inner[0].inner(ratatui::layout::Margin {
+                    horizontal: 2,
+                    vertical: 1,
+                }),
+            );
+            frame.render_widget(
+                List::new(rows).style(Style::default().fg(warning_fg).bg(warning_bg)),
+                inner[1].inner(ratatui::layout::Margin {
+                    horizontal: 2,
+                    vertical: 0,
+                }),
             );
         }
         Modal::TextInput { title, value, kind } => {
@@ -1627,52 +2306,51 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
             scroll,
         } => {
             let mut text = String::new();
+            let is_spanish = matches!(lang.trim(), "spanish" | "español" | "espanol");
             let title = match lang.trim() {
                 "spanish" | "español" | "espanol" => "Plan de commits",
                 _ => "Commit plan",
             };
-            let summary_label = match lang.trim() {
-                "spanish" | "español" | "espanol" => "Resumen",
-                _ => "Summary",
+            let files_label = if is_spanish { "Archivos" } else { "Files" };
+            let scope_label = if is_spanish { "Alcance" } else { "Scope" };
+            let scope_value = if app.core.config.staged_only {
+                if is_spanish {
+                    "Solo archivos staged"
+                } else {
+                    "Staged changes only"
+                }
+            } else if is_spanish {
+                "Todos los cambios: staged, unstaged y untracked"
+            } else {
+                "All changes: staged, unstaged, and untracked"
             };
-            let files_label = match lang.trim() {
-                "spanish" | "español" | "espanol" => "Archivos",
-                _ => "Files",
-            };
-            let reason_label = match lang.trim() {
-                "spanish" | "español" | "espanol" => "Criterio",
-                _ => "Reason",
-            };
+            let mut unique_files: Vec<&str> = Vec::new();
+            for group in &plan.groups {
+                for file in &group.files {
+                    if !unique_files.iter().any(|path| *path == file.path) {
+                        unique_files.push(file.path.as_str());
+                    }
+                }
+            }
 
-            text.push_str(&format!("{}: {}\n", summary_label, plan.summary));
+            text.push_str(&format!("{}: {}\n", scope_label, scope_value));
             text.push_str(&format!(
-                "{}: {}\n\n",
-                if matches!(lang.trim(), "spanish" | "español" | "espanol") {
+                "{}: {} | {}: {}\n\n",
+                if is_spanish {
                     "Commits propuestos"
                 } else {
                     "Proposed commits"
                 },
-                plan.groups.len()
+                plan.groups.len(),
+                files_label,
+                unique_files.len()
             ));
 
             for (index, group) in plan.groups.iter().enumerate() {
                 text.push_str(&format!("{}. {}\n", index + 1, group.commit.title()));
-                if !group.commit.body.trim().is_empty() {
-                    text.push_str(&format!("   {}\n", group.commit.body.trim()));
-                }
-                if !group.rationale.trim().is_empty() {
-                    text.push_str(&format!(
-                        "   {}: {}\n",
-                        reason_label,
-                        group.rationale.trim()
-                    ));
-                }
                 text.push_str(&format!("   {}:\n", files_label));
                 for file in &group.files {
-                    text.push_str(&format!(
-                        "   - {} ({}) - {}\n",
-                        file.path, file.status, file.description
-                    ));
+                    text.push_str(&format!("   - {} ({})\n", file.path, file.status));
                 }
                 text.push('\n');
             }
@@ -1697,9 +2375,9 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
 
             let hint = match lang.trim() {
                 "spanish" | "español" | "espanol" => {
-                    "↑↓/PgUp/PgDn scroll  Tab/←→ acción  Enter ejecutar  Esc cancelar"
+                    "↑↓/Tab acción  ←→ acción  PgUp/PgDn scroll  Enter confirmar  Esc cancelar"
                 }
-                _ => "↑↓/PgUp/PgDn scroll  Tab/←→ action  Enter execute  Esc cancel",
+                _ => "↑↓/Tab action  ←→ action  PgUp/PgDn scroll  Enter confirm  Esc cancel",
             };
             let inner_plan = Layout::default()
                 .direction(Direction::Vertical)
@@ -1786,12 +2464,41 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
                     .style(Style::default().bg(colors.modal_bg)),
                 area,
             );
+            let commit_text_lines = text.lines().count();
+            let commit_visible = inner_commit[0].height as usize;
+            let commit_max_scroll = commit_text_lines.saturating_sub(commit_visible);
+            let commit_effective_scroll = (*scroll).min(commit_max_scroll);
             frame.render_widget(
                 Paragraph::new(text)
-                    .scroll((*scroll as u16, 0))
+                    .scroll((commit_effective_scroll as u16, 0))
                     .wrap(Wrap { trim: true }),
                 inner_commit[0],
             );
+            if commit_max_scroll > 0 {
+                let indicator = if commit_effective_scroll >= commit_max_scroll {
+                    "\u{25b2} PgUp".to_string()
+                } else {
+                    format!(
+                        "\u{25bc} PgDn  {}/{}",
+                        commit_effective_scroll + 1,
+                        commit_max_scroll + 1
+                    )
+                };
+                let indicator_area = Rect {
+                    x: inner_commit[0].x,
+                    y: inner_commit[0].y + inner_commit[0].height.saturating_sub(1),
+                    width: inner_commit[0].width,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        indicator,
+                        Style::default().fg(colors.muted),
+                    ))
+                    .alignment(Alignment::Right),
+                    indicator_area,
+                );
+            }
             frame.render_widget(
                 plain_action_list(&actions, *selected, colors),
                 inner_commit[1],
@@ -1803,37 +2510,354 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
             selected,
             scroll,
         } => {
-            let text = format!("base: {}\n\ntitle: {}\n\n{}", base, draft.title, draft.body);
-            let actions = match lang.trim() {
-                "spanish" | "español" | "espanol" => ["Crear PR", "Cancelar"],
-                _ => ["Create PR", "Cancel"],
+            let is_spanish = matches!(lang.trim(), "spanish" | "español" | "espanol");
+            let pr_title = if is_spanish {
+                "Revisar Pull Request"
+            } else {
+                "Review Pull Request"
             };
-            let inner_pr = Layout::default()
-                .direction(Direction::Vertical)
-                .constraints([Constraint::Min(1), Constraint::Length(4)])
-                .split(area);
-            let pr_title = match lang.trim() {
-                "spanish" | "español" | "espanol" => {
-                    "Pull Request \u{2502} \u{2191}\u{2195} Enter  PgUp/PgDn scroll  Esc atrás"
-                }
-                _ => "Pull Request \u{2502} \u{2191}\u{2195} Enter  PgUp/PgDn scroll  Esc back",
+            let actions = if is_spanish {
+                vec![
+                    OnboardingAction {
+                        label: "Crear PR".to_string(),
+                        help:
+                            "Crea el pull request en GitHub con el titulo y descripcion generados."
+                                .to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Cancelar".to_string(),
+                        help: "Descarta el PR y vuelve al chat.".to_string(),
+                    },
+                ]
+            } else {
+                vec![
+                    OnboardingAction {
+                        label: "Create PR".to_string(),
+                        help: "Creates the pull request on GitHub with the generated title and description.".to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Cancel".to_string(),
+                        help: "Discards the PR and returns to chat.".to_string(),
+                    },
+                ]
             };
-            frame.render_widget(
-                Block::default()
-                    .title(pr_title)
-                    .title_alignment(ratatui::layout::Alignment::Center)
-                    .borders(Borders::ALL)
-                    .border_style(Style::default().fg(colors.border))
-                    .style(Style::default().bg(colors.modal_bg)),
-                area,
+            let header = if is_spanish {
+                format!(
+                    "Creando PR de \u{201c}{}\u{201d} \u{2192} \u{201c}{}\u{201d}\nRevisa el titulo y la descripcion generados por IA. Desplazate con PgUp/PgDn para ver el cuerpo completo.",
+                    draft.title.as_str().chars().take(40).collect::<String>(),
+                    base
+                )
+            } else {
+                format!(
+                    "Creating PR from \u{201c}{}\u{201d} \u{2192} \u{201c}{}\u{201d}\nReview the AI-generated title and description. Scroll with PgUp/PgDn to see the full body.",
+                    draft.title.as_str().chars().take(40).collect::<String>(),
+                    base
+                )
+            };
+            let title_label = if is_spanish { "T\u{00ed}tulo" } else { "Title" };
+            let base_label = if is_spanish { "Base" } else { "Base" };
+            let desc_label = if is_spanish {
+                "Descripci\u{00f3}n"
+            } else {
+                "Description"
+            };
+            let text = format!(
+                "{base_label}:  {base}\n\n{title_label}:\n{title}\n\n{desc_label}:\n{body}",
+                base_label = base_label,
+                base = base,
+                title_label = title_label,
+                title = draft.title,
+                desc_label = desc_label,
+                body = draft.body
             );
+            let block = modal_block_with_border(pr_title, colors, colors.accent);
+            frame.render_widget(block.clone(), area);
+            let inner = block.inner(area);
+            let padded = inner.inner(ratatui::layout::Margin {
+                horizontal: 2,
+                vertical: 1,
+            });
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(6),
+                ])
+                .split(padded);
+            frame.render_widget(
+                Paragraph::new(header)
+                    .wrap(Wrap { trim: true })
+                    .style(Style::default().fg(colors.accent).bold()),
+                layout[0],
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "\u{2500}".repeat(layout[1].width as usize),
+                    Style::default().fg(colors.border),
+                )),
+                layout[1],
+            );
+            let text_line_count = text.lines().count();
+            let visible_text_height = layout[2].height as usize;
+            let max_pr_scroll = text_line_count.saturating_sub(visible_text_height);
+            let effective_scroll = (*scroll).min(max_pr_scroll);
             frame.render_widget(
                 Paragraph::new(text)
-                    .scroll((*scroll as u16, 0))
-                    .wrap(Wrap { trim: true }),
-                inner_pr[0],
+                    .scroll((effective_scroll as u16, 0))
+                    .wrap(Wrap { trim: true })
+                    .style(Style::default().fg(colors.text)),
+                layout[2],
             );
-            frame.render_widget(plain_action_list(&actions, *selected, colors), inner_pr[1]);
+            // Scroll position indicator between text and actions
+            if max_pr_scroll > 0 {
+                let indicator = if effective_scroll >= max_pr_scroll {
+                    "\u{25b2} PgUp".to_string()
+                } else {
+                    format!(
+                        "\u{25bc} PgDn  {}/{}",
+                        effective_scroll + 1,
+                        max_pr_scroll + 1
+                    )
+                };
+                let indicator_area = Rect {
+                    x: layout[2].x,
+                    y: layout[2].y + layout[2].height.saturating_sub(1),
+                    width: layout[2].width,
+                    height: 1,
+                };
+                frame.render_widget(
+                    Paragraph::new(Span::styled(
+                        indicator,
+                        Style::default().fg(colors.muted),
+                    ))
+                    .alignment(Alignment::Right),
+                    indicator_area,
+                );
+            }
+            frame.render_widget(
+                onboarding_action_list(&actions, *selected, colors),
+                layout[3],
+            );
+        }
+        Modal::ExistingPrs { prs, selected, .. } => {
+            let is_spanish = matches!(lang.trim(), "spanish" | "español" | "espanol");
+            let title = if is_spanish {
+                "PR existente detectado"
+            } else {
+                "Existing PR detected"
+            };
+            let actions = if is_spanish {
+                vec![
+                    OnboardingAction {
+                        label: "Actualizar PR".to_string(),
+                        help: "Envia los nuevos commits al PR existente.".to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Cerrar y Recrear".to_string(),
+                        help: "Cierra el PR actual y crea uno nuevo desde esta rama.".to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Cancelar".to_string(),
+                        help: "Vuelve al chat sin modificar ningun PR.".to_string(),
+                    },
+                ]
+            } else {
+                vec![
+                    OnboardingAction {
+                        label: "Update PR".to_string(),
+                        help: "Pushes new commits to the existing pull request.".to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Close and Recreate".to_string(),
+                        help: "Closes the current PR and creates a new one from this branch."
+                            .to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Cancel".to_string(),
+                        help: "Returns to chat without modifying any PR.".to_string(),
+                    },
+                ]
+            };
+            let header = if is_spanish {
+                "Ya existe un pull request desde esta rama hacia el destino seleccionado. Revisa los PRs existentes y eleg\u{00ed} c\u{00f3}mo proceder:"
+            } else {
+                "A pull request already exists from this branch to the selected target. Review the existing PRs and choose how to proceed:"
+            };
+            let pr_info: Vec<ListItem> = prs
+                .iter()
+                .map(|pr| {
+                    let author = pr
+                        .author
+                        .as_ref()
+                        .map(|a| a.login.as_str())
+                        .unwrap_or("unknown");
+                    let body_preview = pr
+                        .body
+                        .as_deref()
+                        .unwrap_or("")
+                        .lines()
+                        .filter(|l| !l.trim().is_empty())
+                        .next()
+                        .unwrap_or("")
+                        .chars()
+                        .take(80)
+                        .collect::<String>();
+                    let detail = if body_preview.is_empty() {
+                        if is_spanish {
+                            format!("#{} por @{}", pr.number, author)
+                        } else {
+                            format!("#{} by @{}", pr.number, author)
+                        }
+                    } else if is_spanish {
+                        format!("#{} por @{} \u{2014} {}", pr.number, author, body_preview)
+                    } else {
+                        format!("#{} by @{} \u{2014} {}", pr.number, author, body_preview)
+                    };
+                    ListItem::new(Line::from(vec![
+                        Span::styled(pr.title.clone(), Style::default().fg(colors.text).bold()),
+                        Span::raw("\n"),
+                        Span::styled(detail, Style::default().fg(colors.muted)),
+                    ]))
+                })
+                .collect();
+            let block = modal_block_with_border(title, colors, colors.accent);
+            frame.render_widget(block.clone(), area);
+            let inner = block.inner(area);
+            let padded = inner.inner(ratatui::layout::Margin {
+                horizontal: 2,
+                vertical: 1,
+            });
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(8),
+                ])
+                .split(padded);
+            frame.render_widget(
+                Paragraph::new(header)
+                    .wrap(Wrap { trim: true })
+                    .style(Style::default().fg(colors.accent).bold()),
+                layout[0],
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "\u{2500}".repeat(layout[1].width as usize),
+                    Style::default().fg(colors.border),
+                )),
+                layout[1],
+            );
+            frame.render_widget(
+                List::new(pr_info).block(Block::default().borders(Borders::NONE)),
+                layout[2],
+            );
+            frame.render_widget(
+                onboarding_action_list(&actions, *selected, colors),
+                layout[3],
+            );
+        }
+        Modal::ConflictResolution { selected, base } => {
+            let is_spanish = matches!(lang.trim(), "spanish" | "español" | "espanol");
+            let title = if is_spanish {
+                "Conflictos de fusion detectados"
+            } else {
+                "Merge conflicts detected"
+            };
+            let actions = if is_spanish {
+                vec![
+                    OnboardingAction {
+                        label: "Resolver con IA (Recomendado)".to_string(),
+                        help: "La IA analiza los conflictos y propone una solucion automatica."
+                            .to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Resolver manualmente".to_string(),
+                        help:
+                            "Abre los archivos con conflictos para que los resuelvas por tu cuenta."
+                                .to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Cancelar".to_string(),
+                        help: "Vuelve al chat sin resolver los conflictos.".to_string(),
+                    },
+                ]
+            } else {
+                vec![
+                    OnboardingAction {
+                        label: "Resolve with AI (Recommended)".to_string(),
+                        help: "AI analyzes the conflicts and proposes an automatic fix."
+                            .to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Resolve manually".to_string(),
+                        help: "Opens the conflicted files for you to resolve by hand.".to_string(),
+                    },
+                    OnboardingAction {
+                        label: "Cancel".to_string(),
+                        help: "Returns to chat without resolving conflicts.".to_string(),
+                    },
+                ]
+            };
+            let header = if is_spanish {
+                format!(
+                    "No se puede fusionar automaticamente esta rama en \u{201c}{}\u{201d} porque hay conflictos. Elegi como resolverlos:",
+                    base
+                )
+            } else {
+                format!(
+                    "Cannot automatically merge this branch into \u{201c}{}\u{201d} due to conflicts. Choose how to resolve them:",
+                    base
+                )
+            };
+            let block = modal_block_with_border(title, colors, colors.warning);
+            frame.render_widget(block.clone(), area);
+            let inner = block.inner(area);
+            let padded = inner.inner(ratatui::layout::Margin {
+                horizontal: 2,
+                vertical: 1,
+            });
+            let layout = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Length(3),
+                    Constraint::Length(1),
+                    Constraint::Min(1),
+                    Constraint::Length(8),
+                ])
+                .split(padded);
+            frame.render_widget(
+                Paragraph::new(header)
+                    .wrap(Wrap { trim: true })
+                    .style(Style::default().fg(colors.warning).bold()),
+                layout[0],
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    "\u{2500}".repeat(layout[1].width as usize),
+                    Style::default().fg(colors.border),
+                )),
+                layout[1],
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled(
+                    if is_spanish {
+                        "Usa \u{2190}\u{2192} para cambiar opcion, Enter para confirmar, Esc para cancelar."
+                    } else {
+                        "Use \u{2190}\u{2192} to change option, Enter to confirm, Esc to cancel."
+                    },
+                    Style::default().fg(colors.muted),
+                ))
+                .wrap(Wrap { trim: true }),
+                layout[2],
+            );
+            frame.render_widget(
+                onboarding_action_list(&actions, *selected, colors),
+                layout[3],
+            );
         }
         Modal::Setup { selected } => {
             let is_spanish = matches!(lang.trim(), "spanish" | "español" | "espanol");
@@ -2206,7 +3230,7 @@ fn plain_action_list<T: AsRef<str>>(
             ]))
         })
         .collect::<Vec<_>>();
-    List::new(items)
+    List::new(items).style(Style::default().bg(colors.modal_bg))
 }
 
 fn onboarding_action_list(
@@ -3250,11 +4274,15 @@ fn settings_description(selected: usize, language: &str) -> &'static str {
 }
 
 fn modal_block(title: &str, colors: Palette) -> Block<'_> {
+    modal_block_with_border(title, colors, colors.border)
+}
+
+fn modal_block_with_border(title: &str, colors: Palette, border: Color) -> Block<'_> {
     Block::default()
         .title(title)
         .title_alignment(ratatui::layout::Alignment::Center)
         .borders(Borders::ALL)
-        .border_style(Style::default().fg(colors.border))
+        .border_style(Style::default().fg(border))
         .style(Style::default().bg(colors.modal_bg))
 }
 
@@ -3423,7 +4451,8 @@ mod tests {
 
     use super::*;
     use crate::application::{AppCore, OllamaHealth};
-    use crate::domain::{Config, LlmContextUsage};
+    use crate::domain::commit::CommitGroup;
+    use crate::domain::{CommitMessage, CommitPlan, Config, FileEntry, LlmContextUsage};
     use crate::infrastructure::dependencies::PlatformOs;
     use crate::infrastructure::{
         BranchOption, BranchSource, DependencyDoctor, DependencyKind, DependencyState,
@@ -3541,6 +4570,71 @@ mod tests {
             .join("")
     }
 
+    fn commit_plan_with_groups(count: usize) -> CommitPlan {
+        CommitPlan {
+            summary: "grouped changes".to_string(),
+            groups: (0..count)
+                .map(|index| CommitGroup {
+                    commit: CommitMessage {
+                        commit_type: "fix".to_string(),
+                        scope: "tui".to_string(),
+                        subject: format!("compact plan {}", index + 1),
+                        body: "body should not dominate the review modal".to_string(),
+                    },
+                    files: vec![FileEntry {
+                        id: format!("src/file{}.rs", index + 1),
+                        path: format!("src/file{}.rs", index + 1),
+                        status: "modified".to_string(),
+                        description: "test file".to_string(),
+                        patch: None,
+                    }],
+                    rationale: "same change context".to_string(),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn commit_plan_review_shows_all_changes_scope() {
+        let mut app = make_app();
+        app.core.config.staged_only = false;
+        app.modal = Some(Modal::CommitPlanReview {
+            plan: commit_plan_with_groups(2),
+            selected: 0,
+            scroll: 0,
+        });
+
+        let text = render_to_text(&app, 120, 28);
+
+        assert!(
+            text.contains("All changes: staged, unstaged, and untracked"),
+            "{text}"
+        );
+        assert!(text.contains("Proposed commits"), "{text}");
+        assert!(text.contains("Files: 2"), "{text}");
+        assert!(text.contains("src/file1.rs (modified)"), "{text}");
+        assert!(text.contains("src/file2.rs (modified)"), "{text}");
+        assert!(!text.contains("Summary"), "{text}");
+        assert!(!text.contains("grouped changes"), "{text}");
+        assert!(!text.contains("same change context"), "{text}");
+        assert!(!text.contains("body should not dominate"), "{text}");
+    }
+
+    #[test]
+    fn commit_plan_review_shows_staged_only_scope() {
+        let mut app = make_app();
+        app.core.config.staged_only = true;
+        app.modal = Some(Modal::CommitPlanReview {
+            plan: commit_plan_with_groups(1),
+            selected: 0,
+            scroll: 0,
+        });
+
+        let text = render_to_text(&app, 120, 28);
+
+        assert!(text.contains("Staged changes only"), "{text}");
+    }
+
     #[test]
     fn long_assistant_message_scrolls_without_truncation_marker() {
         let mut app = make_app();
@@ -3583,6 +4677,18 @@ mod tests {
         assert!(!text.contains("```"), "{text}");
         assert!(!text.contains("`code`"), "{text}");
         assert!(!text.contains("[OpenAI]("), "{text}");
+    }
+
+    #[test]
+    fn scout_mode_labels_assistant_messages_as_scout() {
+        let mut app = make_app();
+        app.execution_mode = ExecutionMode::Scout;
+        app.push_assistant("Scout analysis ready.");
+
+        let text = render_to_text(&app, 100, 18);
+
+        assert!(text.contains("Scout"), "{text}");
+        assert_eq!(text.matches("Autopilot").count(), 1, "{text}");
     }
 
     fn mock_branch_modal() -> Modal {
@@ -3770,6 +4876,24 @@ mod tests {
     }
 
     #[test]
+    fn reset_confirmation_explains_safe_scope() {
+        let mut app = make_app();
+        app.modal = Some(Modal::Confirm {
+            title: "Reset configuration".to_string(),
+            message: crate::ui::state::reset_confirmation_message("English"),
+            selected: 1,
+            kind: crate::ui::state::ConfirmKind::ResetConfiguration,
+        });
+
+        let text = render_to_text(&app, 100, 24);
+
+        assert!(text.contains("Reset configuration"), "{text}");
+        assert!(text.contains("Not deleted: .git"), "{text}");
+        assert!(text.contains("Reset settings"), "{text}");
+        assert!(text.contains("Cancel"), "{text}");
+    }
+
+    #[test]
     fn onboarding_progress_uses_accent_not_warning_for_current_normal_step() {
         let mut app = make_app();
         app.onboarding_active = true;
@@ -3918,7 +5042,9 @@ mod tests {
         ));
 
         assert!(text.contains("Ollama needs model"), "{text}");
-        assert!(text.contains("github auth"), "{text}");
+        assert!(text.contains("PR auth needed"), "{text}");
+        assert!(!text.contains("GitHub needs login"), "{text}");
+        assert!(!text.contains("github auth"), "{text}");
     }
 
     #[test]
@@ -3928,6 +5054,11 @@ mod tests {
         app.core.vram_mb = Some(10 * 1024);
         app.ollama_health = Some(OllamaHealth::ready("0.9.0".to_string()));
         app.dependency_doctor = Some(doctor_with(DependencyState::Ready, DependencyState::Ready));
+        app.last_context_usage = Some(LlmContextUsage {
+            estimated_tokens: 900,
+            limit: 1_000,
+            truncated: true,
+        });
 
         let text = lines_text(&responsive_status_lines(
             &app,
@@ -3941,6 +5072,8 @@ mod tests {
         assert!(!text.contains("GB"), "{text}");
         assert!(!text.contains("MB"), "{text}");
         assert!(!text.contains("Ollama Provider"), "{text}");
+        assert!(!text.contains("Context"), "{text}");
+        assert!(!text.contains("Diff truncated"), "{text}");
     }
 
     #[test]
@@ -3976,15 +5109,16 @@ mod tests {
     fn full_render_shows_commit_busy_message_only_in_input_row() {
         let mut app = make_app();
         app.busy = true;
-        app.busy_message = "Ollama is generating a structured commit plan...".to_string();
+        app.busy_message = "Generating a structured commit plan...".to_string();
         app.ollama_health = Some(OllamaHealth::ready("0.9.0".to_string()));
 
         let text = render_to_text(&app, 100, 24);
         let occurrences = text
-            .matches("Ollama is generating a structured commit plan...")
+            .matches("Generating a structured commit plan...")
             .count();
 
         assert_eq!(occurrences, 1, "{text}");
+        assert!(!text.contains("Ollama is generating"), "{text}");
     }
 
     #[test]
@@ -4061,5 +5195,236 @@ mod tests {
 
         assert_eq!(style.fg, Some(Color::Rgb(15, 23, 42)));
         assert_eq!(style.bg, Some(Color::Rgb(250, 204, 21)));
+    }
+
+    #[test]
+    fn pr_draft_modal_renders_title_and_actions() {
+        let mut app = make_app();
+        app.core.config.language = "English".to_string();
+        app.modal = Some(Modal::PrDraft {
+            base: "main".to_string(),
+            draft: crate::domain::commit::PullRequestDraft {
+                title: "feat: add dark mode".to_string(),
+                body: "- Added toggle\n- Updated theme".to_string(),
+            },
+            selected: 0,
+            scroll: 0,
+        });
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("Review Pull Request"), "{text}");
+        assert!(text.contains("Creating PR from"), "{text}");
+        assert!(text.contains("feat: add dark mode"), "{text}");
+        assert!(text.contains("Create PR"), "{text}");
+        assert!(text.contains("Cancel"), "{text}");
+        assert!(text.contains("main"), "{text}");
+    }
+
+    #[test]
+    fn pr_draft_modal_shows_description() {
+        let mut app = make_app();
+        app.modal = Some(Modal::PrDraft {
+            base: "develop".to_string(),
+            draft: crate::domain::commit::PullRequestDraft {
+                title: "fix: bug".to_string(),
+                body: "This fixes the critical bug.".to_string(),
+            },
+            selected: 0,
+            scroll: 0,
+        });
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("This fixes the critical bug."), "{text}");
+        assert!(text.contains("Description"), "{text}");
+    }
+
+    #[test]
+    fn pr_draft_modal_spanish_actions() {
+        let mut app = make_app();
+        app.core.config.language = "Spanish".to_string();
+        app.modal = Some(Modal::PrDraft {
+            base: "main".to_string(),
+            draft: crate::domain::commit::PullRequestDraft {
+                title: "feat: test".to_string(),
+                body: "Body".to_string(),
+            },
+            selected: 0,
+            scroll: 0,
+        });
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("Revisar Pull Request"), "{text}");
+        assert!(text.contains("Crear PR"), "{text}");
+        assert!(text.contains("Cancelar"), "{text}");
+    }
+
+    #[test]
+    fn pr_draft_modal_minimum_size() {
+        let mut app = make_app();
+        app.modal = Some(Modal::PrDraft {
+            base: "main".to_string(),
+            draft: crate::domain::commit::PullRequestDraft {
+                title: "T".to_string(),
+                body: "B".to_string(),
+            },
+            selected: 0,
+            scroll: 0,
+        });
+
+        let text = render_to_text(&app, 60, 18);
+
+        assert!(text.contains("Create PR"), "{text}");
+        assert!(text.contains("Cancel"), "{text}");
+    }
+
+    #[test]
+    fn conflict_resolution_modal_renders_actions() {
+        let mut app = make_app();
+        app.modal = Some(Modal::ConflictResolution {
+            base: "main".to_string(),
+            selected: 0,
+        });
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("conflict"), "{text}");
+    }
+
+    #[test]
+    fn existing_prs_modal_renders_pr_list() {
+        let mut app = make_app();
+        app.modal = Some(Modal::ExistingPrs {
+            prs: vec![
+                crate::domain::commit::PrInfo {
+                    number: 1,
+                    title: "Fix bug".to_string(),
+                    url: "https://github.com/test/repo/pull/1".to_string(),
+                    author: Some(crate::domain::commit::PrAuthor {
+                        login: "user".into(),
+                    }),
+                    body: None,
+                },
+                crate::domain::commit::PrInfo {
+                    number: 2,
+                    title: "Add feature".to_string(),
+                    url: "https://github.com/test/repo/pull/2".to_string(),
+                    author: Some(crate::domain::commit::PrAuthor {
+                        login: "dev".into(),
+                    }),
+                    body: None,
+                },
+            ],
+            base: "main".to_string(),
+            selected: 0,
+        });
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("Existing PR detected"), "{text}");
+        assert!(text.contains("Fix bug"), "{text}");
+        assert!(text.contains("Add feature"), "{text}");
+        assert!(text.contains("#1"), "{text}");
+        assert!(text.contains("#2"), "{text}");
+    }
+
+    #[test]
+    fn commit_plan_modal_renders_when_streaming() {
+        let mut app = make_app();
+        app.busy = true;
+        app.history.push(crate::ui::state::ChatEntry {
+            role: crate::ui::state::ChatRole::Assistant,
+            message: "Analyzing changes...".to_string(),
+        });
+        app.history.push(crate::ui::state::ChatEntry {
+            role: crate::ui::state::ChatRole::User,
+            message: "Commit Plan".to_string(),
+        });
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("Commit Plan"), "{text}");
+        assert!(text.contains("Analyzing changes..."), "{text}");
+    }
+
+    #[test]
+    fn text_input_modal_renders_model_name_input() {
+        let mut app = make_app();
+        app.modal = Some(Modal::TextInput {
+            title: "Model Name".to_string(),
+            value: "gpt-4.1".to_string(),
+            kind: TextInputKind::ModelName,
+        });
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("Model Name"), "{text}");
+        assert!(text.contains("gpt-4.1"), "{text}");
+    }
+
+    #[test]
+    fn text_input_modal_renders_api_key_input() {
+        let mut app = make_app();
+        app.modal = Some(Modal::TextInput {
+            title: "API Key".to_string(),
+            value: "sk-1234567890".to_string(),
+            kind: TextInputKind::ApiKey,
+        });
+
+        let text = render_to_text(&app, 80, 24);
+
+        assert!(text.contains("API Key"), "{text}");
+        assert!(!text.contains("sk-1234567890"), "API key should be masked");
+    }
+
+
+    #[test]
+    fn render_small_layout_does_not_panic() {
+        let app = make_app();
+        let _ = render_to_text(&app, 10, 5);
+        let _ = render_to_text(&app, 20, 2);
+        let _ = render_to_text(&app, 5, 20);
+        let _ = render_to_text(&app, 0, 0);
+    }
+
+    #[test]
+    fn render_branch_switch_distinguishes_protected_branches() {
+        let mut app = make_app();
+        app.modal = Some(Modal::BranchSwitch {
+            branches: SwitchBranches {
+                remote: vec![
+                    BranchOption {
+                        name: "main".to_string(),
+                        source: BranchSource::Remote,
+                        last_commit_unix: Some(20),
+                        is_current: false,
+                    },
+                ],
+                local: vec![
+                    BranchOption {
+                        name: "feature/api".to_string(),
+                        source: BranchSource::Local,
+                        last_commit_unix: Some(30),
+                        is_current: true,
+                    },
+                ],
+            },
+            selected: 0,
+        });
+
+        let text = render_to_text(&app, 80, 24);
+        assert!(text.contains("Switch branch"), "{text}");
+        assert!(text.contains("main"), "{text}");
+        assert!(text.contains("feature/api current"), "{text}");
+    }
+
+    #[test]
+    fn render_empty_commit_log_shows_placeholder_in_history() {
+        let mut app = make_app();
+        app.push_system("No commits found.".to_string());
+        let text = render_to_text(&app, 80, 24);
+        assert!(text.contains("No commits found."), "{text}");
     }
 }

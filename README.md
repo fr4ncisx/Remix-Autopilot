@@ -1,6 +1,9 @@
 # Remix Autopilot
 
-![Actual Version](https://img.shields.io/badge/version-0.1.0--beta-F54927?style=flat-square) ![Rust latest](https://img.shields.io/badge/Rust-latest-orange?style=flat-square&logo=rust) ![Ratatui TUI](https://img.shields.io/badge/TUI-Ratatui-5c7cfa?style=flat-square) ![Provider aware AI](https://img.shields.io/badge/LLM-provider--aware-22c55e?style=flat-square) ![Git automation](https://img.shields.io/badge/Git-automation-CC5666?style=flat-square&logo=git) ![Tests cargo](https://img.shields.io/badge/tests-cargo-16a34a?style=flat-square)
+![Actual Version](https://img.shields.io/badge/version-0.2.0--beta-F54927?style=flat-square) ![Rust latest](https://img.shields.io/badge/Rust-latest-orange?style=flat-square&logo=rust) ![Ratatui TUI](https://img.shields.io/badge/TUI-Ratatui-5c7cfa?style=flat-square) ![Provider aware AI](https://img.shields.io/badge/LLM-provider--aware-22c55e?style=flat-square) ![Git automation](https://img.shields.io/badge/Git-automation-CC5666?style=flat-square&logo=git) ![Tests cargo](https://img.shields.io/badge/tests-cargo-16a34a?style=flat-square)
+
+> [!WARNING]
+> **Use at your own risk.** This project is currently in **Beta**. There can still be bugs in the AI assistance and in the code design itself. Exhaustive end-to-end (E2E) testing has not been completed yet to guarantee 100% precise operation under all environments, workflows, and Git configurations. Always review the AI-generated commit plans and pull requests before execution.
 
 Remix Autopilot is a Rust TUI for developers who want reviewable Git
 automation with a configurable AI provider. You launch it inside a working
@@ -235,6 +238,8 @@ press `Tab` to autocomplete it.
 | `/setup`        | Initialize Git, add `origin`, or create a GitHub repository.                                         |
 | `/theme`        | Change the color theme.                                                                              |
 | `/config`       | Open interactive settings, or onboarding if required.                                                |
+| `/reset`        | Reset app configuration, API keys, and `origin` without deleting `.git` or local files.               |
+| `/resolve`      | Open the next pending setup, provider, or dependency issue in an actionable modal.                    |
 | `/help`         | Show in-app help.                                                                                    |
 | `/exit`         | Quit the application.                                                                                |
 
@@ -384,6 +389,21 @@ The app currently supports these themes:
 - `Dracula`
 - `HighContrast`
 - `Light`
+
+### Reset configuration
+
+Use `/reset` when you want to return Remix Autopilot to the first-run setup
+flow. The command opens a confirmation modal before it changes anything.
+
+The safe reset removes:
+
+- The selected AI provider, model, base URL, and saved global preferences.
+- API keys stored in the OS secret store for API-backed providers.
+- The `origin` remote from the current Git repository, if one exists.
+
+The safe reset doesn't remove `.git`, commits, branches, local files, or remote
+history. After the reset completes, onboarding opens again so you can configure
+the app from the beginning.
 
 This is an example of the default config shape:
 

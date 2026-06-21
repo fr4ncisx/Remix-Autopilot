@@ -11,7 +11,7 @@ pub use dependencies::{
     DependencyAction, DependencyActionKind, DependencyDoctor, DependencyKind, DependencyState,
     DependencyStatus, PackageManager, PlatformInfo,
 };
-pub use git::{BranchOption, BranchSource, Git, RepoStatus, SwitchBranches};
+pub use git::{BranchOption, BranchSource, CommitLogEntry, Git, RepoStatus, SwitchBranches};
 pub use github::GitHubCli;
 pub use llm::LlmClient;
 pub use ollama::{OllamaClient, detect_vram};
