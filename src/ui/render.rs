@@ -1264,6 +1264,9 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
     let colors = palette(app.core.config.theme);
     let area = match modal {
         Modal::OnboardingWizard { .. } => centered_rect(82, 78, frame.area()),
+        Modal::PrDraft { .. }
+        | Modal::CommitPlanReview { .. }
+        | Modal::CommitReview { .. } => centered_rect(85, 80, frame.area()),
         _ => centered_rect(68, 60, frame.area()),
     };
     if area.width < 10 || area.height < 5 {
@@ -4873,15 +4876,13 @@ mod tests {
     fn conflict_resolution_modal_renders_actions() {
         let mut app = make_app();
         app.modal = Some(Modal::ConflictResolution {
-            file: "src/main.rs".to_string(),
-            conflict: "<<<<<<< HEAD\nfoo\n=======\nbar\n>>>>>>> branch".to_string(),
+            base: "main".to_string(),
             selected: 0,
         });
 
         let text = render_to_text(&app, 80, 24);
 
-        assert!(text.contains("Conflict"), "{text}");
-        assert!(text.contains("src/main.rs"), "{text}");
+        assert!(text.contains("conflict"), "{text}");
     }
 
     #[test]
@@ -4909,13 +4910,12 @@ mod tests {
                 },
             ],
             base: "main".to_string(),
-            head: "feature".to_string(),
             selected: 0,
         });
 
         let text = render_to_text(&app, 80, 24);
 
-        assert!(text.contains("Existing Pull Requests"), "{text}");
+        assert!(text.contains("Existing PR detected"), "{text}");
         assert!(text.contains("Fix bug"), "{text}");
         assert!(text.contains("Add feature"), "{text}");
         assert!(text.contains("#1"), "{text}");
@@ -4925,9 +4925,15 @@ mod tests {
     #[test]
     fn commit_plan_modal_renders_when_streaming() {
         let mut app = make_app();
-        app.modal = Some(Modal::CommitPlan);
         app.busy = true;
-        app.streaming_response = Some("Analyzing changes...".to_string());
+        app.history.push(crate::ui::state::ChatEntry {
+            role: crate::ui::state::ChatRole::Assistant,
+            message: "Analyzing changes...".to_string(),
+        });
+        app.history.push(crate::ui::state::ChatEntry {
+            role: crate::ui::state::ChatRole::User,
+            message: "Commit Plan".to_string(),
+        });
 
         let text = render_to_text(&app, 80, 24);
 
@@ -4939,10 +4945,9 @@ mod tests {
     fn text_input_modal_renders_model_name_input() {
         let mut app = make_app();
         app.modal = Some(Modal::TextInput {
+            title: "Model Name".to_string(),
+            value: "gpt-4.1".to_string(),
             kind: TextInputKind::ModelName,
-            buffer: "gpt-4.1".to_string(),
-            cursor: 7,
-            secret: false,
         });
 
         let text = render_to_text(&app, 80, 24);
@@ -4955,10 +4960,9 @@ mod tests {
     fn text_input_modal_renders_api_key_input() {
         let mut app = make_app();
         app.modal = Some(Modal::TextInput {
+            title: "API Key".to_string(),
+            value: "sk-1234567890".to_string(),
             kind: TextInputKind::ApiKey,
-            buffer: "sk-1234567890".to_string(),
-            cursor: 13,
-            secret: true,
         });
 
         let text = render_to_text(&app, 80, 24);
@@ -4967,14 +4971,52 @@ mod tests {
         assert!(!text.contains("sk-1234567890"), "API key should be masked");
     }
 
+
     #[test]
-    fn history_limit_modal_renders_options() {
+    fn render_small_layout_does_not_panic() {
+        let app = make_app();
+        let _ = render_to_text(&app, 10, 5);
+        let _ = render_to_text(&app, 20, 2);
+        let _ = render_to_text(&app, 5, 20);
+        let _ = render_to_text(&app, 0, 0);
+    }
+
+    #[test]
+    fn render_branch_switch_distinguishes_protected_branches() {
         let mut app = make_app();
-        app.modal = Some(Modal::HistoryLimit);
-        app.core.config.history_limit = crate::domain::HistoryLimit::Medium;
+        app.modal = Some(Modal::BranchSwitch {
+            branches: SwitchBranches {
+                remote: vec![
+                    BranchOption {
+                        name: "main".to_string(),
+                        source: BranchSource::Remote,
+                        last_commit_unix: Some(20),
+                        is_current: false,
+                    },
+                ],
+                local: vec![
+                    BranchOption {
+                        name: "feature/api".to_string(),
+                        source: BranchSource::Local,
+                        last_commit_unix: Some(30),
+                        is_current: true,
+                    },
+                ],
+            },
+            selected: 0,
+        });
 
         let text = render_to_text(&app, 80, 24);
+        assert!(text.contains("Switch branch"), "{text}");
+        assert!(text.contains("main"), "{text}");
+        assert!(text.contains("feature/api current"), "{text}");
+    }
 
-        assert!(text.contains("History"), "{text}");
+    #[test]
+    fn render_empty_commit_log_shows_placeholder_in_history() {
+        let mut app = make_app();
+        app.push_system("No commits found.".to_string());
+        let text = render_to_text(&app, 80, 24);
+        assert!(text.contains("No commits found."), "{text}");
     }
 }

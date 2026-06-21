@@ -1000,7 +1000,7 @@ mod tests {
         let context = DiffContext::default();
         let prompt = commit_plan_prompt("Spanish", &context);
         assert!(prompt.contains("Spanish"));
-        assert!(prompt.contains("commit-plan"));
+        assert!(prompt.contains("commit planner"));
     }
 
     #[test]

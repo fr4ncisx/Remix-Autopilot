@@ -5825,72 +5825,68 @@ mod tests {
     #[tokio::test]
     async fn streaming_chunk_appends_to_response() {
         let mut app = make_app();
-        app.modal = Some(Modal::CommitPlan);
         app.busy = true;
-        app.streaming_response = Some("Hello".to_string());
+        app.history.push(ChatEntry {
+            role: ChatRole::Assistant,
+            message: "Hello".to_string(),
+        });
+        app.streaming_response_index = Some(0);
+        let (tx, _rx) = mpsc::channel(4);
 
-        app.apply_outcome(AsyncOutcome::StreamingChunk(" World".to_string()));
+        app.process_event(
+            AppEvent::AsyncOutcome(Box::new(AsyncOutcome::StreamingChunk(" World".to_string()))),
+            &tx,
+        )
+        .await
+        .unwrap();
 
-        assert_eq!(app.streaming_response.as_deref(), Some("Hello World"));
+        assert_eq!(app.history[0].message, "Hello World");
         assert!(app.busy);
     }
 
     #[tokio::test]
     async fn stream_end_finalizes_response() {
         let mut app = make_app();
-        app.modal = Some(Modal::CommitPlan);
         app.busy = true;
-        app.streaming_response = Some("final content".to_string());
+        app.history.push(ChatEntry {
+            role: ChatRole::Assistant,
+            message: "final content".to_string(),
+        });
+        app.streaming_response_index = Some(0);
+        let (tx, _rx) = mpsc::channel(4);
 
-        app.apply_outcome(AsyncOutcome::StreamEnd);
+        app.process_event(
+            AppEvent::AsyncOutcome(Box::new(AsyncOutcome::StreamEnd)),
+            &tx,
+        )
+        .await
+        .unwrap();
 
         assert!(!app.busy);
-        assert!(app.streaming_response.is_some());
+        assert_eq!(app.streaming_response_index, None);
     }
 
     #[tokio::test]
     async fn commit_created_clears_busy_and_adds_message() {
         let mut app = make_app();
         app.busy = true;
-        app.modal = Some(Modal::CommitPlan);
-        app.streaming_response = Some("old".to_string());
-        let msg = crate::domain::commit::CommitMessage {
-            hash: "abc1234".into(),
-            summary: "feat: test".into(),
-            body: None,
-            files_changed: 2,
-            insertions: 10,
-            deletions: 3,
-            co_authors: vec![],
+        let msg = crate::domain::CommitMessage {
+            commit_type: "feat".to_string(),
+            scope: "test".to_string(),
+            subject: "hello".to_string(),
+            body: "body message".to_string(),
         };
+        let (tx, _rx) = mpsc::channel(4);
 
-        app.apply_outcome(AsyncOutcome::CommitCreated(msg));
-
-        assert!(!app.busy);
-        assert!(app.history.iter().any(|m| m.text.contains("abc1234")));
-    }
-
-    #[tokio::test]
-    async fn merge_check_result_true_sets_can_merge() {
-        let mut app = make_app();
-        app.busy = true;
-
-        app.apply_outcome(AsyncOutcome::MergeCheckResult(true, "ok".into()));
+        app.process_event(
+            AppEvent::AsyncOutcome(Box::new(AsyncOutcome::CommitCreated(msg))),
+            &tx,
+        )
+        .await
+        .unwrap();
 
         assert!(!app.busy);
-        assert!(app.can_merge);
-    }
-
-    #[tokio::test]
-    async fn merge_check_result_false_sets_cannot_merge() {
-        let mut app = make_app();
-        app.busy = true;
-        app.can_merge = true;
-
-        app.apply_outcome(AsyncOutcome::MergeCheckResult(false, "conflict".into()));
-
-        assert!(!app.busy);
-        assert!(!app.can_merge);
+        assert!(app.history.iter().any(|m| m.message.contains("feat(test): hello")));
     }
 
     #[tokio::test]
@@ -5906,46 +5902,69 @@ mod tests {
             }),
             body: None,
         }];
+        let (tx, _rx) = mpsc::channel(4);
 
-        app.apply_outcome(AsyncOutcome::ExistingPrs(
-            prs,
-            "main".into(),
-            "feature".into(),
-        ));
+        app.process_event(
+            AppEvent::AsyncOutcome(Box::new(AsyncOutcome::ExistingPrs(
+                prs,
+                "main".into(),
+                "feature".into(),
+            ))),
+            &tx,
+        )
+        .await
+        .unwrap();
 
         assert!(!app.busy);
         assert!(matches!(app.modal, Some(Modal::ExistingPrs { .. })));
     }
 
     #[tokio::test]
-    async fn commit_log_ready_updates_staged_view() {
+    async fn commit_log_ready_opens_commit_log_modal() {
         let mut app = make_app();
         app.busy = true;
-        app.modal = Some(Modal::CommitPlan);
-        let entries = vec![crate::domain::commit::CommitLogEntry {
+        let entries = vec![crate::infrastructure::CommitLogEntry {
             hash: "deadbeef".into(),
-            summary: "initial commit".into(),
-            files_changed: 1,
+            short_hash: "deadbee".into(),
+            decorations: "".into(),
+            subject: "initial commit".into(),
+            author: "author".into(),
+            relative_time: "1 day ago".into(),
         }];
+        let (tx, _rx) = mpsc::channel(4);
 
-        app.apply_outcome(AsyncOutcome::CommitLogReady(entries));
+        app.process_event(
+            AppEvent::AsyncOutcome(Box::new(AsyncOutcome::CommitLogReady(entries))),
+            &tx,
+        )
+        .await
+        .unwrap();
 
         assert!(!app.busy);
-        assert!(app.staged_view.entries.len() == 1);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::CommitLog { ref entries, selected: 0, action: 0, scroll: 0 }) if entries.len() == 1
+        ));
     }
 
     #[tokio::test]
     async fn push_completed_adds_success_message() {
         let mut app = make_app();
         app.busy = true;
+        let (tx, _rx) = mpsc::channel(4);
 
-        app.apply_outcome(AsyncOutcome::PushCompleted("Pushed to origin/main".into()));
+        app.process_event(
+            AppEvent::AsyncOutcome(Box::new(AsyncOutcome::PushCompleted("Pushed to origin/main".into()))),
+            &tx,
+        )
+        .await
+        .unwrap();
 
         assert!(!app.busy);
         assert!(
             app.history
                 .iter()
-                .any(|m| m.text.contains("Pushed to origin/main"))
+                .any(|m| m.message.contains("Pushed to origin/main"))
         );
     }
 
@@ -5953,10 +5972,195 @@ mod tests {
     async fn error_outcome_clears_busy_and_shows_message() {
         let mut app = make_app();
         app.busy = true;
+        let (tx, _rx) = mpsc::channel(4);
 
-        app.apply_outcome(AsyncOutcome::Error(AppError::GhMissing));
+        app.process_event(
+            AppEvent::AsyncOutcome(Box::new(AsyncOutcome::Error(AppError::NoChanges))),
+            &tx,
+        )
+        .await
+        .unwrap();
 
         assert!(!app.busy);
-        assert!(app.history.iter().any(|m| m.role == ChatRole::System));
+        assert!(app.history.iter().any(|m| m.role == ChatRole::Error));
+    }
+
+    #[tokio::test]
+    async fn ctrl_c_sets_running_false_no_modal() {
+        let mut app = make_app();
+        let (tx, _rx) = mpsc::channel(4);
+        app.running = true;
+        app.modal = None;
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.handle_key(ctrl_c, tx).await.unwrap();
+        assert!(!app.running);
+    }
+
+    #[tokio::test]
+    async fn esc_clears_input_and_suggestions() {
+        let mut app = make_app();
+        let (tx, _rx) = mpsc::channel(4);
+        app.input = "some input".to_string();
+        app.suggestions = vec![
+            Suggestion {
+                command: "/commit",
+                description: "desc",
+                intent: Intent::Commit,
+                score: 80,
+            }
+        ];
+        app.handle_key(key(KeyCode::Esc), tx).await.unwrap();
+        assert!(app.input.is_empty());
+        assert!(app.suggestions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn enter_with_unknown_command_adds_help_without_busy() {
+        let mut app = make_app();
+        let (tx, _rx) = mpsc::channel(4);
+        app.input = "/unknowncommand".to_string();
+        app.busy = false;
+        app.handle_key(key(KeyCode::Enter), tx).await.unwrap();
+        assert!(!app.busy);
+        assert!(
+            app.history
+                .iter()
+                .any(|m| m.message.contains("Use slash commands, for example /commit or /help."))
+        );
+    }
+
+    #[tokio::test]
+    async fn tab_with_selected_suggestion_replaces_input() {
+        let mut app = make_app();
+        let (tx, _rx) = mpsc::channel(4);
+        app.input = "/co".to_string();
+        app.refresh_suggestions();
+        app.selected_suggestion = 0;
+        let suggestion = app.suggestions[0].command.to_string();
+        app.handle_key(key(KeyCode::Tab), tx).await.unwrap();
+        assert_eq!(app.input, suggestion);
+        assert!(app.suggestions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn push_offline_adds_error_without_confirmation() {
+        let mut app = make_app();
+        let (tx, _rx) = mpsc::channel(4);
+        app.internet_online = Some(false);
+        app.modal = None;
+        app.execute_intent(Intent::Push, tx);
+        assert!(app.modal.is_none());
+        assert!(app.history.iter().any(|m| m.role == ChatRole::Error && m.message.contains("offline")));
+    }
+
+    #[tokio::test]
+    async fn pr_offline_adds_error_without_remote_flow() {
+        let mut app = make_app();
+        let (tx, _rx) = mpsc::channel(4);
+        app.internet_online = Some(false);
+        app.busy = false;
+        app.execute_intent(Intent::Pr, tx);
+        assert!(!app.busy);
+        assert!(app.history.iter().any(|m| m.role == ChatRole::Error && m.message.contains("offline")));
+    }
+
+    #[tokio::test]
+    async fn commit_on_protected_branch_starts_fetching_branches() {
+        let dir = tempdir().unwrap();
+        git_in(dir.path(), &["init", "-b", "main"]);
+        let mut app = make_app_in(dir.path().to_path_buf());
+        let (tx, _rx) = mpsc::channel(4);
+        app.execute_intent(Intent::Commit, tx);
+        assert!(app.busy);
+        assert_eq!(app.busy_message, "Fetching branches...");
+        assert_eq!(app.blocked_intent, Some(Intent::Commit));
+    }
+
+    #[tokio::test]
+    async fn commit_on_normal_branch_starts_commit_plan() {
+        let dir = tempdir().unwrap();
+        git_in(dir.path(), &["init", "-b", "feature/tests"]);
+        let mut app = make_app_in(dir.path().to_path_buf());
+        let (tx, _rx) = mpsc::channel(4);
+        app.ollama_health = Some(OllamaHealth::ready("0.9.0".to_string()));
+        app.execute_intent(Intent::Commit, tx);
+        assert!(app.busy);
+        assert_eq!(app.busy_message, "Generating a structured commit plan...");
+    }
+
+    #[tokio::test]
+    async fn settings_does_not_open_if_onboarding_blocks() {
+        let dir = tempdir().unwrap();
+        let mut app = make_app_in(dir.path().to_path_buf());
+        let (tx, _rx) = mpsc::channel(4);
+        assert!(app.should_block_for_onboarding());
+        app.execute_intent(Intent::Config, tx);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::OnboardingWizard {
+                step: OnboardingStep::LanguageSelection,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn dependency_issue_blocking_changes_label() {
+        let issue = DependencyStatus::ollama_not_running(
+            &platform(),
+            Some("0.9.0".to_string()),
+            "down".to_string(),
+        );
+
+        let actions_non_blocking = dependency_modal_actions(&issue, false, "English");
+        let close_action = actions_non_blocking.last().unwrap();
+        assert_eq!(close_action.label, "Close");
+        assert!(matches!(close_action.action, DependencyModalActionKind::Close));
+
+        let actions_blocking = dependency_modal_actions(&issue, true, "English");
+        let exit_action = actions_blocking.last().unwrap();
+        assert_eq!(exit_action.label, "Exit CLI");
+        assert!(matches!(exit_action.action, DependencyModalActionKind::ExitCli));
+    }
+
+    #[tokio::test]
+    async fn merge_check_result_false_opens_conflict_resolution() {
+        let mut app = make_app();
+        app.busy = true;
+        let (tx, _rx) = mpsc::channel(4);
+
+        app.process_event(
+            AppEvent::AsyncOutcome(Box::new(AsyncOutcome::MergeCheckResult(false, "main".into()))),
+            &tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(!app.busy);
+        assert!(matches!(
+            app.modal,
+            Some(Modal::ConflictResolution {
+                ref base,
+                selected: 0,
+            }) if base == "main"
+        ));
+    }
+
+    #[tokio::test]
+    async fn merge_check_result_true_does_not_open_conflict_resolution() {
+        let mut app = make_app();
+        app.busy = true;
+        app.modal = None;
+        let (tx, _rx) = mpsc::channel(4);
+
+        app.process_event(
+            AppEvent::AsyncOutcome(Box::new(AsyncOutcome::MergeCheckResult(true, "main".into()))),
+            &tx,
+        )
+        .await
+        .unwrap();
+
+        assert!(app.busy);
+        assert!(app.modal.is_none());
     }
 }

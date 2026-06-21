@@ -960,7 +960,7 @@ mod tests {
         let status = DependencyStatus::missing(DependencyKind::Git, &platform, None);
         assert_eq!(
             status.suggested_command.as_deref(),
-            Some("sudo apt-get install git")
+            Some("sudo apt-get install -y git")
         );
     }
 }
