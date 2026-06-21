@@ -229,13 +229,29 @@ async fn run_loop(terminal: &mut Term, core: AppCore) -> Result<()> {
     );
 
     let result: Result<()> = async {
+        terminal.draw(|frame| draw(frame, &app))?;
+
         while app.running {
             tokio::select! {
                 Some(event) = rx.recv() => {
                     app.process_event(event, &tx).await?;
 
+                    // Drain queued events but break as soon as a busy
+                    // cycle completes.  This guarantees at least one
+                    // terminal.draw() with busy=true (spinner visible)
+                    // before the result is rendered.
                     while let Ok(next) = rx.try_recv() {
+                        let completes_busy = matches!(
+                            &next,
+                            AppEvent::AsyncOutcome(o) if app.busy && (
+                                matches!(o.as_ref(), AsyncOutcome::StreamEnd)
+                                || outcome_completes_busy(o.as_ref())
+                            )
+                        );
                         app.process_event(next, &tx).await?;
+                        if completes_busy {
+                            break;
+                        }
                     }
                 }
                 () = tokio::time::sleep(Duration::from_millis(16)), if app.busy => {
@@ -420,6 +436,22 @@ impl TuiApp {
                 AsyncOutcome::StreamEnd => {
                     self.busy = false;
                     self.in_flight_abort = None;
+                    // If no chunks arrived (still shows placeholder), remove the stale entry
+                    if let Some(index) = self.streaming_response_index {
+                        let placeholder =
+                            translate("Working on it...", &self.core.config.language);
+                        if self
+                            .history
+                            .get(index)
+                            .is_some_and(|e| e.message == placeholder)
+                        {
+                            self.history.remove(index);
+                        } else if let Some(entry) = self.history.get_mut(index) {
+                            if entry.role == ChatRole::Assistant && is_spanish(&self.core.config.language) {
+                                entry.message = sanitize_ai_mentions(&entry.message);
+                            }
+                        }
+                    }
                     self.streaming_response_index = None;
                     self.trim_history();
                     if self.execution_mode == ExecutionMode::Scout {
@@ -451,7 +483,15 @@ impl TuiApp {
                     );
                 }
                 other => {
-                    if outcome_completes_busy(&other) {
+                    let is_doctor = matches!(&other, AsyncOutcome::DependencyDoctor(_));
+                    let completes = outcome_completes_busy(&other);
+                    let should_complete = if is_doctor {
+                        self.dependency_retry.is_some()
+                    } else {
+                        completes
+                    };
+
+                    if should_complete {
                         self.busy = false;
                         self.in_flight_abort = None;
                         self.streaming_response_index = None;
@@ -603,8 +643,20 @@ impl TuiApp {
                 self.suggestions.clear();
             }
             KeyCode::Char(ch) => {
-                self.input.push(ch);
-                self.refresh_suggestions();
+                let mut new_input = self.input.clone();
+                new_input.push(ch);
+                let is_valid = if !new_input.starts_with('/') {
+                    false
+                } else if let Some(space_idx) = new_input.find(' ') {
+                    let cmd_part = &new_input[..space_idx];
+                    is_valid_command(cmd_part)
+                } else {
+                    is_valid_command_prefix(&new_input)
+                };
+                if is_valid {
+                    self.input.push(ch);
+                    self.refresh_suggestions();
+                }
             }
             KeyCode::Backspace => {
                 self.input.pop();
@@ -749,7 +801,7 @@ impl TuiApp {
             Intent::Lang(None) => self.open_language_picker(),
             Intent::Switch => self.start_switch_branch_flow(tx),
             Intent::Log => self.start_commit_log_flow(tx),
-            Intent::Explain | Intent::Review | Intent::Status => {
+            Intent::Explain | Intent::Review | Intent::Status | Intent::Diff(Some(_)) => {
                 self.busy = true;
                 self.busy_message = intent_busy_message(&intent, &lang);
                 self.push_streaming_assistant(translate("Working on it...", &lang));
@@ -757,13 +809,19 @@ impl TuiApp {
                 let streaming_intent = intent.clone();
                 let tx_clone = tx.clone();
                 let handle = tokio::spawn(async move {
-                    let stream_ctx = StreamingContext::new(&tx_clone);
+                    // Yield once so the event loop renders at least one frame
+                    // with busy=true before the result arrives (guarantees spinner
+                    // is visible even for near-instant responses).
+                    tokio::task::yield_now().await;
+                    let StreamingContext { tx_token, forwarder } = StreamingContext::new(&tx_clone);
                     let result = match streaming_intent {
-                        Intent::Explain => core.explain_stream(stream_ctx.tx_token).await,
-                        Intent::Review => core.review_stream(stream_ctx.tx_token).await,
-                        Intent::Status => core.status_summary_stream(stream_ctx.tx_token).await,
+                        Intent::Explain => core.explain_stream(tx_token).await,
+                        Intent::Review => core.review_stream(tx_token).await,
+                        Intent::Status => core.status_summary_stream(tx_token).await,
+                        Intent::Diff(Some(branch)) => core.diff_stream(tx_token, Some(branch)).await,
                         _ => unreachable!("non-streaming intent routed to streaming handler"),
                     };
+                    let _ = forwarder.await;
                     let outcome = match result {
                         Ok(_) => AsyncOutcome::StreamEnd,
                         Err(e) => AsyncOutcome::Error(e),
@@ -771,16 +829,23 @@ impl TuiApp {
                     let _ = tx_clone
                         .send(AppEvent::AsyncOutcome(Box::new(outcome)))
                         .await;
-                    let _ = stream_ctx.forwarder.await;
                 });
                 self.in_flight_abort = Some(handle.abort_handle());
             }
-            Intent::Staged | Intent::Diff | Intent::DeprecatedDryRun => {
+            Intent::Diff(None) => {
+                self.blocked_intent = Some(Intent::Diff(None));
+                self.busy = true;
+                self.busy_message = intent_busy_message(&intent, &lang);
+                let core = self.core.clone();
+                self.spawn_outcome_task(tx, switch_branches_outcome(core));
+            }
+            Intent::Staged | Intent::DeprecatedDryRun => {
                 self.busy = true;
                 self.busy_message = intent_busy_message(&intent, &lang);
                 let mut core = self.core.clone();
                 let intent_clone = intent.clone();
                 let handle = tokio::spawn(async move {
+                    tokio::task::yield_now().await;
                     let outcome = match core.execute_simple(&intent_clone).await {
                         Ok(message) => AsyncOutcome::Message(message),
                         Err(error) => AsyncOutcome::Error(error),
@@ -954,6 +1019,14 @@ impl TuiApp {
                         selected,
                         new_branch: String::new(),
                         editing_new_branch: selected == 1,
+                    });
+                } else if self.blocked_intent == Some(Intent::Diff(None)) {
+                    let mut filtered_branches = branches.clone();
+                    filtered_branches.local.retain(|b| !b.is_current);
+                    filtered_branches.remote.retain(|b| !b.is_current);
+                    self.modal = Some(Modal::BranchDiff {
+                        branches: filtered_branches,
+                        selected: 0,
                     });
                 } else {
                     self.modal = Some(Modal::BranchSwitch {
@@ -1196,8 +1269,8 @@ impl TuiApp {
                 return Ok(());
             }
             KeyCode::Up => {
-                if let Some(Modal::PrDraft { scroll, .. }) = self.modal.as_mut() {
-                    *scroll = scroll.saturating_sub(1);
+                if let Some(Modal::PrDraft { selected, .. }) = self.modal.as_mut() {
+                    *selected = if *selected == 0 { 1 } else { 0 };
                 } else if let Some(Modal::CommitPlanReview { selected, .. }) = self.modal.as_mut() {
                     let max = 2;
                     *selected = if *selected == 0 { max } else { *selected - 1 };
@@ -1229,8 +1302,8 @@ impl TuiApp {
                 }
             }
             KeyCode::Down => {
-                if let Some(Modal::PrDraft { scroll, .. }) = self.modal.as_mut() {
-                    *scroll = scroll.saturating_add(1);
+                if let Some(Modal::PrDraft { selected, .. }) = self.modal.as_mut() {
+                    *selected = if *selected == 0 { 1 } else { 0 };
                 } else if let Some(Modal::CommitPlanReview { selected, .. }) = self.modal.as_mut() {
                     *selected = (*selected + 1) % 3;
                 } else if let Some(Modal::CommitLog {
@@ -1276,7 +1349,7 @@ impl TuiApp {
                 {
                     let max = actions.len().saturating_sub(1);
                     *selected = if *selected == 0 { max } else { *selected - 1 };
-                } else if let Some(Modal::BranchSwitch { .. }) = self.modal.as_mut() {
+                } else if matches!(self.modal, Some(Modal::BranchSwitch { .. }) | Some(Modal::BranchDiff { .. })) {
                     // No action.
                 } else if let Some(Modal::CommitPlanReview { selected, .. }) = self.modal.as_mut() {
                     let max = 2;
@@ -1312,7 +1385,7 @@ impl TuiApp {
                 {
                     let max = actions.len().saturating_sub(1);
                     *selected = if *selected == max { 0 } else { *selected + 1 };
-                } else if let Some(Modal::BranchSwitch { .. }) = self.modal.as_mut() {
+                } else if matches!(self.modal, Some(Modal::BranchSwitch { .. }) | Some(Modal::BranchDiff { .. })) {
                     // No action.
                 } else if let Some(Modal::CommitPlanReview { selected, .. }) = self.modal.as_mut() {
                     let max = 2;
@@ -1481,6 +1554,9 @@ impl TuiApp {
             }
             Modal::BranchSwitch { branches, selected } => {
                 self.activate_branch_switch(branches, selected, tx).await?
+            }
+            Modal::BranchDiff { branches, selected } => {
+                self.activate_branch_diff(branches, selected, tx).await?
             }
             Modal::ProtectedBranchCommit {
                 branches,
@@ -1987,6 +2063,22 @@ impl TuiApp {
         Ok(())
     }
 
+    async fn activate_branch_diff(
+        &mut self,
+        branches: SwitchBranches,
+        selected: usize,
+        tx: mpsc::Sender<AppEvent>,
+    ) -> Result<()> {
+        let Some(branch) = branches.get(selected).cloned() else {
+            return Ok(());
+        };
+
+        self.modal = None;
+        self.blocked_intent = None;
+        self.execute_intent(Intent::Diff(Some(branch.name)), tx);
+        Ok(())
+    }
+
     async fn activate_protected_branch_commit(
         &mut self,
         branches: SwitchBranches,
@@ -2121,18 +2213,18 @@ impl TuiApp {
                 let mut core = self.core.clone();
                 let tx_clone = tx.clone();
                 tokio::spawn(async move {
-                    let stream_ctx = StreamingContext::new(&tx_clone);
-                    let outcome = match core
-                        .scout_question_stream(&value, stream_ctx.tx_token)
-                        .await
-                    {
+                    let StreamingContext { tx_token, forwarder } = StreamingContext::new(&tx_clone);
+                    let result = core
+                        .scout_question_stream(&value, tx_token)
+                        .await;
+                    let _ = forwarder.await;
+                    let outcome = match result {
                         Ok(_) => AsyncOutcome::StreamEnd,
                         Err(e) => AsyncOutcome::Error(e),
                     };
                     let _ = tx_clone
                         .send(AppEvent::AsyncOutcome(Box::new(outcome)))
                         .await;
-                    let _ = stream_ctx.forwarder.await;
                 });
             }
             TextInputKind::BaseUrl => {
@@ -2183,15 +2275,16 @@ impl TuiApp {
                 let mut core = self.core.clone();
                 let tx_clone = tx.clone();
                 tokio::spawn(async move {
-                    let stream_ctx = StreamingContext::new(&tx_clone);
-                    let outcome = match core.explain_stream(stream_ctx.tx_token).await {
+                    let StreamingContext { tx_token, forwarder } = StreamingContext::new(&tx_clone);
+                    let result = core.explain_stream(tx_token).await;
+                    let _ = forwarder.await;
+                    let outcome = match result {
                         Ok(_) => AsyncOutcome::StreamEnd,
                         Err(e) => AsyncOutcome::Error(e),
                     };
                     let _ = tx_clone
                         .send(AppEvent::AsyncOutcome(Box::new(outcome)))
                         .await;
-                    let _ = stream_ctx.forwarder.await;
                 });
             }
             1 => {
@@ -2201,15 +2294,16 @@ impl TuiApp {
                 let mut core = self.core.clone();
                 let tx_clone = tx.clone();
                 tokio::spawn(async move {
-                    let stream_ctx = StreamingContext::new(&tx_clone);
-                    let outcome = match core.review_stream(stream_ctx.tx_token).await {
+                    let StreamingContext { tx_token, forwarder } = StreamingContext::new(&tx_clone);
+                    let result = core.review_stream(tx_token).await;
+                    let _ = forwarder.await;
+                    let outcome = match result {
                         Ok(_) => AsyncOutcome::StreamEnd,
                         Err(e) => AsyncOutcome::Error(e),
                     };
                     let _ = tx_clone
                         .send(AppEvent::AsyncOutcome(Box::new(outcome)))
                         .await;
-                    let _ = stream_ctx.forwarder.await;
                 });
             }
             2 => {
@@ -2396,6 +2490,9 @@ impl TuiApp {
                 selected, entries, ..
             } => (selected, entries.len()),
             Modal::BranchSwitch {
+                selected, branches, ..
+            } => (selected, branches.total_count()),
+            Modal::BranchDiff {
                 selected, branches, ..
             } => (selected, branches.total_count()),
             Modal::ProtectedBranchCommit { selected, .. } => (selected, 3),
@@ -2825,9 +2922,11 @@ impl TuiApp {
     }
 
     pub fn push_error(&mut self, error: AppError) {
+        let msg = format!("Error: {}", display_error_message(&error));
+        let translated = translate(&msg, &self.core.config.language);
         self.history.push(ChatEntry {
             role: ChatRole::Error,
-            message: format!("Error: {}", display_error_message(&error)),
+            message: translated,
         });
         self.reset_history_scroll();
         self.trim_history();
@@ -3222,8 +3321,7 @@ impl TuiApp {
 fn outcome_completes_busy(outcome: &AsyncOutcome) -> bool {
     matches!(
         outcome,
-        AsyncOutcome::DependencyDoctor(_)
-            | AsyncOutcome::Message(_)
+        AsyncOutcome::Message(_)
             | AsyncOutcome::Error(_)
             | AsyncOutcome::CommitPlanReady(_, _)
             | AsyncOutcome::CommitLogReady(_)
@@ -3333,6 +3431,18 @@ pub fn translate(text: &str, language: &str) -> String {
     let result: &str = match lang_str {
         "spanish" | "español" | "espanol" => match text {
             "Cancelled." => "Cancelado.",
+            "this directory is not a Git repository" => "este directorio no es un repositorio Git.",
+            "there are no changes to commit" => "no hay cambios para commitear.",
+            "`git` is not installed or is not available in PATH" => "Git no está instalado o no está disponible en el PATH.",
+            "GitHub CLI is not authenticated. Run `gh auth login` and try again." => "GitHub CLI no está autenticado. Ejecuta `gh auth login` e intenta de nuevo.",
+            "GitHub CLI is not authenticated. Run gh auth login and try again." => "GitHub CLI no está autenticado. Ejecuta `gh auth login` e intenta de nuevo.",
+            "`gh` is not installed. Install GitHub CLI and run `gh auth login` to create PRs." => "gh no está instalado. Instala GitHub CLI y ejecuta `gh auth login` para crear PRs.",
+            "gh is not installed. Install GitHub CLI and run gh auth login to create PRs." => "gh no está instalado. Instala GitHub CLI y ejecuta `gh auth login` para crear PRs.",
+            "remote `origin` is required for push and PR" => "se requiere el remoto `origin` para hacer push y PR.",
+            "remote origin is required for push and PR" => "se requiere el remoto `origin` para hacer push y PR.",
+            "Git user.name and user.email must be configured before committing" => "user.name y user.email de Git deben estar configurados antes de hacer commits.",
+            "could not detect current branch; detached HEAD is not supported" => "no se pudo detectar la rama actual; no se admite HEAD desasociado.",
+            "no remote branches were found for origin" => "no se encontraron ramas remotas para origin.",
             "PR cancelled." => "PR cancelado.",
             "Push completed." => "Push completado.",
             "Origin remote added." => "Servidor remoto origin añadido.",
@@ -3423,6 +3533,11 @@ pub fn translate(text: &str, language: &str) -> String {
             "Updating PR..." => "Actualizando PR...",
             "PR closed and recreated successfully." => "PR cerrado y recreado exitosamente.",
             "PR updated successfully." => "PR actualizado exitosamente.",
+            "Git repository initialized." => "Repositorio Git inicializado.",
+            "Setup cancelled." => "Instalación cancelada.",
+            "API key updated." => "Clave API actualizada.",
+            "Model updated." => "Modelo actualizado.",
+            "Base URL updated." => "URL base actualizada.",
             _ => text,
         },
         _ => text,
@@ -3433,8 +3548,47 @@ pub fn translate(text: &str, language: &str) -> String {
     } else {
         match lang_str {
             "spanish" | "español" | "espanol" => {
-                if let Some(model) = text.strip_prefix("Model set to ") {
+                if let Some(rest) = text.strip_prefix("Error: ") {
+                    let err_translated = translate(rest, language);
+                    if err_translated != rest {
+                        format!("Error: {}", err_translated)
+                    } else {
+                        match rest {
+                            "this directory is not a Git repository" => "Error: este directorio no es un repositorio Git.".to_string(),
+                            "there are no changes to commit" => "Error: no hay cambios para commitear.".to_string(),
+                            "git is not installed or is not available in PATH" => "Error: Git no está instalado o no está disponible en el PATH.".to_string(),
+                            "`git` is not installed or is not available in PATH" => "Error: Git no está instalado o no está disponible en el PATH.".to_string(),
+                            "GitHub CLI is not authenticated. Run gh auth login and try again." => "Error: GitHub CLI no está autenticado. Ejecuta `gh auth login` e intenta de nuevo.".to_string(),
+                            "gh is not installed. Install GitHub CLI and run gh auth login to create PRs." => "Error: gh no está instalado. Instala GitHub CLI y ejecuta `gh auth login` para crear PRs.".to_string(),
+                            "remote origin is required for push and PR" => "Error: se requiere el remoto `origin` para hacer push y PR.".to_string(),
+                            "Git user.name and user.email must be configured before committing" => "Error: user.name y user.email de Git deben estar configurados antes de hacer commits.".to_string(),
+                            "could not detect current branch; detached HEAD is not supported" => "Error: no se pudo detectar la rama actual; no se admite HEAD desasociado.".to_string(),
+                            "no remote branches were found for origin" => "Error: no se encontraron ramas remotas para origin.".to_string(),
+                            _ => {
+                                if let Some(json_err) = rest.strip_prefix("LLM returned malformed JSON: ") {
+                                    format!("Error: El LLM devolvió un JSON malformado: {}", json_err)
+                                } else {
+                                    text.to_string()
+                                }
+                            }
+                        }
+                    }
+                } else if let Some(json_err) = text.strip_prefix("LLM returned malformed JSON: ") {
+                    format!("El LLM devolvió un JSON malformado: {}", json_err)
+                } else if let Some(model) = text.strip_prefix("Model set to ") {
                     format!("Modelo configurado en {}.", model)
+                } else if let Some(provider) = text.strip_prefix("Provider set to ") {
+                    format!("Proveedor configurado en {}.", provider)
+                } else if let Some(theme) = text.strip_prefix("Theme changed to ") {
+                    format!("Tema cambiado a {}.", theme)
+                } else if let Some(err) = text.strip_prefix("Could not save language preference: ") {
+                    format!("No se pudo guardar la preferencia de idioma: {}", err)
+                } else if let Some(rest) = text.strip_prefix("Soft reset to `") {
+                    if let Some(hash_rest) = rest.split_once("` selected. No files will be deleted; changes stay staged for recommit.") {
+                        format!("Se seleccionó un reset soft a `{}`. No se borrarán archivos; los cambios permanecen preparados para volver a commitear.", hash_rest.0)
+                    } else {
+                        text.to_string()
+                    }
                 } else if let Some(language) = text.strip_prefix("Language changed to ") {
                     format!("Idioma cambiado a {}", language)
                 } else if let Some(rest) = text.strip_prefix("GitHub repository `") {
@@ -3475,6 +3629,29 @@ pub fn translate(text: &str, language: &str) -> String {
             _ => text.to_string(),
         }
     }
+}
+
+fn is_valid_command_prefix(prefix: &str) -> bool {
+    let commands = [
+        "/commit", "/diff", "/provider", "/model", "/lang", "/switch",
+        "/staged", "/push", "/pr", "/pull-request", "/explain", "/review",
+        "/status", "/log", "/history", "/setup", "/theme", "/reset",
+        "/resolve", "/config", "/help", "/exit", "/dry-run",
+    ];
+    if prefix == "/" {
+        return true;
+    }
+    commands.iter().any(|cmd| cmd.starts_with(prefix))
+}
+
+fn is_valid_command(cmd: &str) -> bool {
+    let commands = [
+        "/commit", "/diff", "/provider", "/model", "/lang", "/switch",
+        "/staged", "/push", "/pr", "/pull-request", "/explain", "/review",
+        "/status", "/log", "/history", "/setup", "/theme", "/reset",
+        "/resolve", "/config", "/help", "/exit", "/dry-run",
+    ];
+    commands.contains(&cmd)
 }
 
 pub const SETTINGS_ROWS: usize = 10;
@@ -3536,6 +3713,10 @@ pub enum Modal {
         scroll: usize,
     },
     BranchSwitch {
+        branches: SwitchBranches,
+        selected: usize,
+    },
+    BranchDiff {
         branches: SwitchBranches,
         selected: usize,
     },
@@ -3666,7 +3847,7 @@ fn intent_busy_message(intent: &Intent, language: &str) -> String {
             Intent::Push => "Haciendo push de la rama...".to_string(),
             Intent::Pr => "Obteniendo ramas remotas...".to_string(),
             Intent::Setup => "Configurando repositorio...".to_string(),
-            Intent::Diff => "Cargando diff...".to_string(),
+            Intent::Diff(_) => "Cargando diff...".to_string(),
             Intent::Provider => "Cargando proveedores...".to_string(),
             Intent::Model => "Obteniendo modelos...".to_string(),
             _ => "Pensando...".to_string(),
@@ -3682,7 +3863,7 @@ fn intent_busy_message(intent: &Intent, language: &str) -> String {
             Intent::Push => "Pushing branch...".to_string(),
             Intent::Pr => "Fetching remote branches...".to_string(),
             Intent::Setup => "Setting up repository...".to_string(),
-            Intent::Diff => "Loading diff...".to_string(),
+            Intent::Diff(_) => "Loading diff...".to_string(),
             Intent::Provider => "Loading providers...".to_string(),
             Intent::Model => "Fetching models...".to_string(),
             _ => "Thinking...".to_string(),
@@ -3734,6 +3915,7 @@ fn intent_requires_ai_provider(intent: &Intent) -> bool {
             | Intent::Status
             | Intent::Pr
             | Intent::Model
+            | Intent::Diff(_)
     )
 }
 
@@ -3746,6 +3928,7 @@ fn intent_requires_ollama(intent: &Intent) -> bool {
             | Intent::Status
             | Intent::Pr
             | Intent::Model
+            | Intent::Diff(_)
     )
 }
 
@@ -4207,6 +4390,92 @@ fn is_spanish(language: &str) -> bool {
         language.to_lowercase().trim(),
         "spanish" | "español" | "espanol"
     )
+}
+
+fn sanitize_ai_mentions(text: &str) -> String {
+    let mut cleaned = text.to_string();
+    
+    // Replace specific multi-word patterns first (from longest/most specific to shortest)
+    cleaned = cleaned.replace("mediante asistencia de la IA", "");
+    cleaned = cleaned.replace("mediante asistencia de la ia", "");
+    cleaned = cleaned.replace("mediante asistencia de IA", "");
+    cleaned = cleaned.replace("mediante asistencia de ia", "");
+    
+    cleaned = cleaned.replace("asistencia de la IA", "asistencia del sistema");
+    cleaned = cleaned.replace("asistencia de la ia", "asistencia del sistema");
+    cleaned = cleaned.replace("asistencia de IA", "asistencia del sistema");
+    cleaned = cleaned.replace("asistencia de ia", "asistencia del sistema");
+    
+    cleaned = cleaned.replace("por parte de la IA", "por parte del sistema");
+    cleaned = cleaned.replace("por parte de la ia", "por parte del sistema");
+    cleaned = cleaned.replace("por parte de IA", "por parte del sistema");
+    cleaned = cleaned.replace("por parte de ia", "por parte del sistema");
+    
+    cleaned = cleaned.replace("el uso de la IA", "el uso del sistema");
+    cleaned = cleaned.replace("el uso de la ia", "el uso del sistema");
+    cleaned = cleaned.replace("el uso de IA", "el uso del sistema");
+    cleaned = cleaned.replace("el uso de ia", "el uso del sistema");
+    
+    cleaned = cleaned.replace("asistido por la IA", "asistido por el sistema");
+    cleaned = cleaned.replace("asistido por la ia", "asistido por el sistema");
+    cleaned = cleaned.replace("asistido por IA", "asistido por el sistema");
+    cleaned = cleaned.replace("asistido por ia", "asistido por el sistema");
+    cleaned = cleaned.replace("asistida por la IA", "asistida por el sistema");
+    cleaned = cleaned.replace("asistida por la ia", "asistida por el sistema");
+    cleaned = cleaned.replace("asistida por IA", "asistida por el sistema");
+    cleaned = cleaned.replace("asistida por ia", "asistida por el sistema");
+    
+    cleaned = cleaned.replace("de la IA", "del sistema");
+    cleaned = cleaned.replace("de la ia", "del sistema");
+    cleaned = cleaned.replace("de IA", "del sistema");
+    cleaned = cleaned.replace("de ia", "del sistema");
+    
+    cleaned = cleaned.replace("con la IA", "con el sistema");
+    cleaned = cleaned.replace("con la ia", "con el sistema");
+    cleaned = cleaned.replace("con IA", "con el sistema");
+    cleaned = cleaned.replace("con ia", "con el sistema");
+    
+    cleaned = cleaned.replace("en la IA", "en el sistema");
+    cleaned = cleaned.replace("en la ia", "en el sistema");
+    cleaned = cleaned.replace("en IA", "en el sistema");
+    cleaned = cleaned.replace("en ia", "en el sistema");
+    
+    cleaned = cleaned.replace("la IA", "el sistema");
+    cleaned = cleaned.replace("la ia", "el sistema");
+    cleaned = cleaned.replace("una IA", "un sistema");
+    cleaned = cleaned.replace("una ia", "un sistema");
+    
+    cleaned = cleaned.replace("Inteligencia Artificial", "sistema");
+    cleaned = cleaned.replace("Inteligencia artificial", "sistema");
+    cleaned = cleaned.replace("inteligencia artificial", "sistema");
+    cleaned = cleaned.replace("Artificial Intelligence", "system");
+    cleaned = cleaned.replace("artificial intelligence", "system");
+    
+    // Replace word variations with boundaries
+    let word_replacements = vec![
+        (" IA ", " sistema "),
+        (" ia ", " sistema "),
+        (" AI ", " sistema "),
+        (" ai ", " sistema "),
+        (" IA.", " sistema."),
+        (" ia.", " sistema."),
+        (" AI.", " sistema."),
+        (" ai.", " sistema."),
+        (" IA,", " sistema,"),
+        (" ia,", " sistema,"),
+        (" AI,", " sistema,"),
+        (" ai,", " sistema,"),
+        (" IA;", " sistema;"),
+        (" ia;", " sistema;"),
+        (" AI;", " sistema;"),
+        (" ai;", " sistema;"),
+    ];
+    
+    for (from, to) in word_replacements {
+        cleaned = cleaned.replace(from, to);
+    }
+    
+    cleaned
 }
 
 fn shutdown_managed_ollama(pid_slot: &Arc<Mutex<Option<u32>>>) {
@@ -6162,5 +6431,20 @@ mod tests {
 
         assert!(app.busy);
         assert!(app.modal.is_none());
+    }
+
+    #[test]
+    fn test_input_validation_helpers() {
+        assert!(is_valid_command_prefix("/"));
+        assert!(is_valid_command_prefix("/c"));
+        assert!(is_valid_command_prefix("/co"));
+        assert!(is_valid_command_prefix("/commit"));
+        assert!(!is_valid_command_prefix("/hell"));
+        assert!(!is_valid_command_prefix("commit"));
+
+        assert!(is_valid_command("/commit"));
+        assert!(is_valid_command("/diff"));
+        assert!(!is_valid_command("/comm"));
+        assert!(!is_valid_command("/hello"));
     }
 }
