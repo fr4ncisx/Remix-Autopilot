@@ -23,7 +23,7 @@ use crate::application::{AppCore, OllamaHealth, help_text};
 use crate::domain::commit::strip_emoji;
 use crate::domain::{
     CommitMessage, CommitPlan, FileEntry, Intent, IntentDecision, IntentParser, LlmContextUsage,
-    LlmProviderKind, PullRequestDraft, Suggestion, slash_suggestions,
+    LlmProviderKind, PullRequestDraft, PrInfo, Suggestion, slash_suggestions,
 };
 use crate::error::{AppError, Result};
 use crate::infrastructure::{
@@ -62,6 +62,8 @@ pub enum AsyncOutcome {
     CommitLogReset(String),
     SwitchBranchesReady(SwitchBranches),
     PrDraft(String, PullRequestDraft),
+    ExistingPrs(Vec<PrInfo>, String, String),
+    MergeCheckResult(bool, String),
     ModelPicker(Vec<String>),
     PushCompleted(String),
     CommitCreated(CommitMessage),
@@ -1043,6 +1045,19 @@ impl TuiApp {
                     scroll: 0,
                 });
             }
+            AsyncOutcome::ExistingPrs(prs, base, _head) => {
+                self.busy = false;
+                self.modal = Some(Modal::ExistingPrs {
+                    prs,
+                    base,
+                    selected: 0,
+                });
+            }
+            AsyncOutcome::MergeCheckResult(false, base) => {
+                self.busy = false;
+                self.modal = Some(Modal::ConflictResolution { base, selected: 0 });
+            }
+            AsyncOutcome::MergeCheckResult(true, _) => {}
             AsyncOutcome::PushCompleted(output) => {
                 self.push_system(push_completed_message(
                     self.core.status().branch.as_str(),
@@ -1243,8 +1258,16 @@ impl TuiApp {
                 }
             }
             KeyCode::Left => {
+                let prev_selected = |selected: &mut usize, max: usize| {
+                    let max = max.saturating_sub(1);
+                    *selected = if *selected == 0 { max } else { *selected - 1 };
+                };
                 if let Some(Modal::PrDraft { selected, .. }) = self.modal.as_mut() {
                     *selected = if *selected == 0 { 1 } else { 0 };
+                } else if let Some(Modal::ExistingPrs { selected, .. }) = self.modal.as_mut() {
+                    prev_selected(selected, 3);
+                } else if let Some(Modal::ConflictResolution { selected, .. }) = self.modal.as_mut() {
+                    prev_selected(selected, 3);
                 } else if matches!(self.modal, Some(Modal::OnboardingWizard { .. })) {
                     // Onboarding actions are list selections; horizontal arrows do not mutate state.
                 } else if let Some(Modal::DependencyIssue {
@@ -1270,8 +1293,16 @@ impl TuiApp {
                 }
             }
             KeyCode::Right => {
+                let next_selected = |selected: &mut usize, max: usize| {
+                    let max = max.saturating_sub(1);
+                    *selected = if *selected == max { 0 } else { *selected + 1 };
+                };
                 if let Some(Modal::PrDraft { selected, .. }) = self.modal.as_mut() {
                     *selected = if *selected == 0 { 1 } else { 0 };
+                } else if let Some(Modal::ExistingPrs { selected, .. }) = self.modal.as_mut() {
+                    next_selected(selected, 3);
+                } else if let Some(Modal::ConflictResolution { selected, .. }) = self.modal.as_mut() {
+                    next_selected(selected, 3);
                 } else if matches!(self.modal, Some(Modal::OnboardingWizard { .. })) {
                     // Onboarding actions are list selections; horizontal arrows do not mutate state.
                 } else if let Some(Modal::DependencyIssue {
@@ -1497,7 +1528,80 @@ impl TuiApp {
                         let _ = tx.send(AppEvent::AsyncOutcome(Box::new(outcome))).await;
                     });
                 } else {
-                    self.push_assistant("PR cancelled.");
+                    self.modal = None;
+                }
+            }
+            Modal::ExistingPrs {
+                prs,
+                selected,
+                base,
+                ..
+            } => {
+                if prs.is_empty() {
+                    self.modal = None;
+                    return Ok(());
+                }
+                let pr = &prs[selected];
+                let number = pr.number;
+                let is_recreate = selected == 1;
+                let is_cancel = selected == 2;
+
+                if is_cancel {
+                    self.modal = None;
+                    self.push_assistant(translate("Cancelled.", &self.core.config.language));
+                    return Ok(());
+                }
+
+                self.busy = true;
+                self.busy_message = translate("Drafting PR updates...", &self.core.config.language);
+                let mut core = self.core.clone();
+                let base = base.clone();
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    match core.draft_pr(&base).await {
+                        Ok(draft) => {
+                            let result = if is_recreate {
+                                core.close_pr(number).and_then(|_| core.create_pr(&base, &draft))
+                            } else {
+                                core.edit_pr(number, &draft)
+                            };
+                            let outcome = match result {
+                                Ok(output) => AsyncOutcome::Message(if output.is_empty() {
+                                    "PR updated successfully.".to_string()
+                                } else {
+                                    output
+                                }),
+                                Err(error) => AsyncOutcome::Error(error),
+                            };
+                            let _ = tx.send(AppEvent::AsyncOutcome(Box::new(outcome))).await;
+                        }
+                        Err(error) => {
+                            let _ = tx.send(AppEvent::AsyncOutcome(Box::new(AsyncOutcome::Error(error)))).await;
+                        }
+                    }
+                });
+            }
+            Modal::ConflictResolution { selected, base } => {
+                let lang = self.core.config.language.clone();
+                match selected {
+                    0 => {
+                        self.busy = true;
+                        self.busy_message = translate("Resolving conflicts with AI...", &lang);
+                        let mut core = self.core.clone();
+                        let base = base.clone();
+                        tokio::spawn(async move {
+                            let outcome = match core.draft_pr(&base).await {
+                                Ok(draft) => AsyncOutcome::PrDraft(base, draft),
+                                Err(error) => AsyncOutcome::Error(error),
+                            };
+                            let _ = tx.send(AppEvent::AsyncOutcome(Box::new(outcome))).await;
+                        });
+                    }
+                    1 => {
+                        self.modal = None;
+                        self.push_assistant(translate("Please resolve conflicts manually, then run /pr again.", &lang));
+                    }
+                    _ => { self.modal = None; }
                 }
             }
             Modal::Setup { selected } => self.activate_setup(selected).await?,
@@ -1578,14 +1682,33 @@ impl TuiApp {
             PickerValue::PrBase(base) => {
                 self.busy = true;
                 let lang = self.core.config.language.clone();
-                self.busy_message = translate("Drafting PR...", &lang);
+                self.busy_message = translate("Checking for existing PRs...", &lang);
                 let mut core = self.core.clone();
+                let base = base.clone();
                 tokio::spawn(async move {
-                    let outcome = match core.draft_pr(&base).await {
-                        Ok(draft) => AsyncOutcome::PrDraft(base, draft),
-                        Err(error) => AsyncOutcome::Error(error),
-                    };
-                    let _ = tx.send(AppEvent::AsyncOutcome(Box::new(outcome))).await;
+                    let head = core.current_branch().unwrap_or_default();
+                    match core.list_open_prs(&head, &base) {
+                        Ok(prs) if !prs.is_empty() => {
+                            let outcome = AsyncOutcome::ExistingPrs(prs, base, head);
+                            let _ = tx.send(AppEvent::AsyncOutcome(Box::new(outcome))).await;
+                        }
+                        Ok(_) => {
+                            let can_merge = core.can_merge(&base);
+                            if can_merge {
+                                let outcome = match core.draft_pr(&base).await {
+                                    Ok(draft) => AsyncOutcome::PrDraft(base, draft),
+                                    Err(error) => AsyncOutcome::Error(error),
+                                };
+                                let _ = tx.send(AppEvent::AsyncOutcome(Box::new(outcome))).await;
+                            } else {
+                                let outcome = AsyncOutcome::MergeCheckResult(false, base);
+                                let _ = tx.send(AppEvent::AsyncOutcome(Box::new(outcome))).await;
+                            }
+                        }
+                        Err(error) => {
+                            let _ = tx.send(AppEvent::AsyncOutcome(Box::new(AsyncOutcome::Error(error)))).await;
+                        }
+                    }
                 });
             }
             PickerValue::Visibility { repo, private } => {
@@ -2199,6 +2322,8 @@ impl TuiApp {
             } => (selected, branches.total_count()),
             Modal::ProtectedBranchCommit { selected, .. } => (selected, 3),
             Modal::PrDraft { selected, .. } => (selected, 2),
+            Modal::ExistingPrs { selected, .. } => (selected, 3),
+            Modal::ConflictResolution { selected, .. } => (selected, 3),
             Modal::Setup { selected } => (selected, 4),
             Modal::TextInput { .. } => return,
             Modal::DependencyIssue {
@@ -3369,6 +3494,15 @@ pub enum Modal {
         draft: PullRequestDraft,
         selected: usize,
         scroll: usize,
+    },
+    ExistingPrs {
+        prs: Vec<PrInfo>,
+        base: String,
+        selected: usize,
+    },
+    ConflictResolution {
+        base: String,
+        selected: usize,
     },
     Setup {
         selected: usize,

@@ -2085,6 +2085,88 @@ fn render_modal(frame: &mut Frame<'_>, app: &TuiApp, modal: &Modal) {
             );
             frame.render_widget(plain_action_list(&actions, *selected, colors), inner_pr[1]);
         }
+        Modal::ExistingPrs {
+            prs,
+            selected,
+            ..
+        } => {
+            let title = match lang.trim() {
+                "spanish" | "español" | "espanol" => "PR existente detectado",
+                _ => "Existing PR detected",
+            };
+            let actions = match lang.trim() {
+                "spanish" | "español" | "espanol" => ["Actualizar PR", "Cerrar y Recrear", "Cancelar"],
+                _ => ["Update PR", "Close and Recreate", "Cancel"],
+            };
+            let inner = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(5)])
+                .split(area);
+
+            frame.render_widget(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(colors.border))
+                    .style(Style::default().bg(colors.modal_bg)),
+                area,
+            );
+
+            let pr_list: Vec<ListItem> = prs
+                .iter()
+                .enumerate()
+                .map(|(i, pr)| {
+                    let style = if i == *selected {
+                        Style::default().fg(colors.accent)
+                    } else {
+                        Style::default()
+                    };
+                    ListItem::new(format!("#{} - {}", pr.number, pr.title)).style(style)
+                })
+                .collect();
+
+            frame.render_widget(
+                List::new(pr_list).block(Block::default().borders(Borders::NONE)),
+                inner[0],
+            );
+            frame.render_widget(plain_action_list(&actions, *selected, colors), inner[1]);
+        }
+        Modal::ConflictResolution { selected, .. } => {
+            let title = match lang.trim() {
+                "spanish" | "español" | "espanol" => "Conflictos de fusión detectados",
+                _ => "Merge conflicts detected",
+            };
+            let msg = match lang.trim() {
+                "spanish" | "español" | "espanol" => {
+                    "Hay conflictos entre las ramas. ¿Cómo deseas resolverlos?"
+                }
+                _ => "There are conflicts between branches. How would you like to resolve them?",
+            };
+            let actions = match lang.trim() {
+                "spanish" | "español" | "espanol" => {
+                    ["Resolver con IA (Recomendado)", "Resolver manualmente", "Cancelar"]
+                }
+                _ => ["Resolve with AI (Recommended)", "Resolve manually", "Cancel"],
+            };
+            let inner = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([Constraint::Min(1), Constraint::Length(5)])
+                .split(area);
+
+            frame.render_widget(
+                Block::default()
+                    .title(title)
+                    .borders(Borders::ALL)
+                    .border_style(Style::default().fg(colors.border))
+                    .style(Style::default().bg(colors.modal_bg)),
+                area,
+            );
+            frame.render_widget(
+                Paragraph::new(msg).wrap(Wrap { trim: true }),
+                inner[0],
+            );
+            frame.render_widget(plain_action_list(&actions, *selected, colors), inner[1]);
+        }
         Modal::Setup { selected } => {
             let is_spanish = matches!(lang.trim(), "spanish" | "español" | "espanol");
             let actions = if is_spanish {
