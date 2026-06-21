@@ -6,12 +6,12 @@ use reqwest::Client;
 use tokio::sync::mpsc;
 
 use crate::domain::commit::{
-    CommitGroup, FileEntry, commit_plan_prompt, explain_prompt, pr_prompt, review_prompt,
-    scout_question_prompt, status_prompt,
+    CommitGroup, FileEntry, commit_plan_prompt, explain_prompt, pr_prompt,
+    resolve_conflict_prompt, review_prompt, scout_question_prompt, status_prompt,
 };
 use crate::domain::{
     CommitMessage, CommitPlan, Config, DiffContext, Intent, LlmContextUsage, LlmProviderKind,
-    PullRequestDraft,
+    PrInfo, PullRequestDraft,
 };
 use crate::error::{AppError, Result};
 use crate::infrastructure::{
@@ -402,13 +402,14 @@ impl AppCore {
             if !paths.is_empty() {
                 self.git.add_paths(&paths)?;
             }
-            for file in group
+            for file_entry in group
                 .files
                 .iter()
-                .filter_map(|file| file.patch.as_deref())
-                .filter(|patch| !patch.trim().is_empty())
+                .filter(|f| f.patch.as_deref().is_some_and(|p| !p.trim().is_empty()))
             {
-                self.git.apply_patch_to_index(file)?;
+                if let Some(patch) = &file_entry.patch {
+                    self.git.apply_patch_to_index(&file_entry.path, patch)?;
+                }
             }
 
             let staged = self.git.diff_context(true, max_chars, context_lines)?;
@@ -772,9 +773,16 @@ impl AppCore {
         }
 
         let model = self.ensure_model().await?;
+        let commits = self.git.commit_log_between(base, &current).unwrap_or_default();
+        let commits_text = commits
+            .iter()
+            .map(|c| format!("{} - {}", c.short_hash, c.subject))
+            .collect::<Vec<_>>()
+            .join("\n");
         let prompt = pr_prompt(
             &self.config.language,
             &context,
+            &commits_text,
             base,
             &current,
             template.as_deref(),
@@ -796,6 +804,35 @@ impl AppCore {
     pub fn create_pr(&self, base: &str, draft: &PullRequestDraft) -> Result<String> {
         let head = self.git.current_branch()?;
         self.github.create_pr(base, &head, draft)
+    }
+
+    pub fn edit_pr(&self, number: i64, draft: &PullRequestDraft) -> Result<String> {
+        self.github.edit_pr(number, draft)
+    }
+
+    pub fn close_pr(&self, number: i64) -> Result<String> {
+        self.github.close_pr(number)
+    }
+
+    #[allow(dead_code)]
+    pub async fn resolve_conflict(&mut self, file: &str) -> Result<String> {
+        let conflict = self.git.read_file(file).unwrap_or_default();
+        let model = self.ensure_model().await?;
+        let prompt = resolve_conflict_prompt(&self.config.language, file, &conflict);
+        let num_ctx = self.calculate_num_ctx(prompt.len());
+        self.llm.generate(&self.config, self.api_key()?.as_deref(), &model, &prompt, num_ctx).await
+    }
+
+    pub fn current_branch(&self) -> Result<String> {
+        self.git.current_branch()
+    }
+
+    pub fn can_merge(&self, base: &str) -> bool {
+        self.git.can_merge(base)
+    }
+
+    pub fn list_open_prs(&self, head: &str, base: &str) -> Result<Vec<PrInfo>> {
+        self.github.list_open_prs(head, base)
     }
 
     pub async fn execute_simple(&mut self, intent: &Intent) -> Result<String> {
